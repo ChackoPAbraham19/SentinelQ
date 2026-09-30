@@ -1,5 +1,13 @@
 # Render deployment
 
+Live website: https://sentinelq-kuft.onrender.com
+
+Render dashboard: https://dashboard.render.com/web/srv-daukri7pn0mc738359kg
+
+Workspace: Festin's workspace. Service: `srv-daukri7pn0mc738359kg`. Initial deployed commit: `ace483fde1a13cde7fa6d99ac672235d66856429`. Blueprint: `exs-daukprl9fdbs739bnvtg`.
+
+Verified on the public HTTPS deployment: homepage, security headers, blocked secret-file routes, authority login/logout, reporter recovery, two-way messages, photo/MP4/TXT/PDF encrypted uploads, review masking/quarantine, byte-for-byte original retrieval with one-use grants, private storage URLs, revision conflicts, and signed history. The synthetic check case and seven test objects were removed afterward; signed audit records remain. The local suite passed all 60 tests before deployment.
+
 One free Render Node web service serves the built frontend and API on the same HTTPS origin. Supabase continues storing the encrypted cases and attachments in Mumbai. Render's nearest supported service region is Singapore; application processing occurs there.
 
 ## Configuration

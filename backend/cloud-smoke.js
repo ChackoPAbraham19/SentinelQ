@@ -8,10 +8,13 @@ const crypto = require('node:crypto');
 const { decryptCaseFields, verifySignedLines } = require('./index_no_deps');
 const { SupabaseStorage } = require('./storage');
 const cloud = new SupabaseStorage(process.env);
+const apiOrigin = process.env.SENTINELQ_SMOKE_URL || 'http://127.0.0.1:4000';
+const apiUrl = new URL(apiOrigin);
+if (apiUrl.origin !== apiOrigin || (apiUrl.protocol !== 'https:' && !['127.0.0.1', 'localhost'].includes(apiUrl.hostname))) throw new Error('Smoke target must be an HTTPS origin or local development server');
 let caseId;
 
 async function request(method, route, body, token, headers = {}) {
-  const response = await fetch(`http://127.0.0.1:4000${route}`, {
+  const response = await fetch(`${apiOrigin}${route}`, {
     method, signal: AbortSignal.timeout(60000), headers: { 'Content-Type': 'application/json',
       ...(token ? { Authorization: `Bearer ${token}` } : {}), ...headers },
     ...(body ? { body: JSON.stringify(body) } : {}),

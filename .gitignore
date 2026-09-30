@@ -1,0 +1,10 @@
+.env
+backend/.env
+frontend/.env
+node_modules/
+.venv/
+backend/data/
+frontend/dist/
+*.zip
+*.log
+.render/

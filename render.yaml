@@ -1,0 +1,39 @@
+services:
+  - type: web
+    name: sentinelq
+    runtime: node
+    plan: free
+    region: singapore
+    buildCommand: node scripts/render-build.js
+    startCommand: node backend/index_no_deps.js
+    healthCheckPath: /readyz
+    autoDeployTrigger: off
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
+      - key: NODE_ENV
+        value: production
+      - key: HOST
+        value: 0.0.0.0
+      - key: SENTINELQ_SERVE_FRONTEND
+        value: "1"
+      - key: SENTINELQ_STORAGE_PROVIDER
+        value: supabase
+      - key: SENTINELQ_REQUIRE_HTTPS
+        value: "1"
+      - key: SENTINELQ_TRUST_PROXY
+        value: "1"
+      - key: SENTINELQ_ALLOW_DEMO_ADMIN
+        value: "0"
+      - key: SENTINELQ_SEED_DEMO
+        value: "0"
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SECRET_KEY
+        sync: false
+      - key: SENTINELQ_STORAGE_KEY
+        sync: false
+      - key: SENTINELQ_AUDIT_KEY
+        sync: false
+      - key: SENTINELQ_JUDICIAL_ACCESS_KEY
+        sync: false

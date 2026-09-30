@@ -1,0 +1,13 @@
+{
+  "name": "sentinelq-backend",
+  "version": "0.1.0",
+  "private": true,
+  "main": "index_no_deps.js",
+  "scripts": {
+    "start": "node index_no_deps.js",
+    "migrate:security": "node migrate_security.js",
+    "cloud:check": "node cloud-setup.js",
+    "cloud:migrate": "node cloud-setup.js --migrate",
+    "test": "node --test"
+  }
+}

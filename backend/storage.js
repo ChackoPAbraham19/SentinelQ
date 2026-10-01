@@ -138,7 +138,7 @@ class SupabaseStorage {
   }
   async writeArtifact(name, bytes) {
     artifactName(name);
-    if (!Buffer.isBuffer(bytes) || bytes.subarray(0, 4).toString() !== 'SQE2') throw new StorageError('Only encrypted evidence may be uploaded', 400);
+    if (!Buffer.isBuffer(bytes) || !['SQE2', 'SQC1'].includes(bytes.subarray(0, 4).toString())) throw new StorageError('Only encrypted evidence may be uploaded', 400);
     await this.request(`/storage/v1/object/${this.bucket}/${encodeURIComponent(name)}`, {
       method: 'POST', body: bytes, binary: true,
       headers: { 'x-upsert': 'false', 'Cache-Control': 'no-store' },

@@ -1,3 +1,4 @@
+const court = require('../test-support/court');
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { spawn } = require('node:child_process');
@@ -9,7 +10,7 @@ const TEST_ADMIN_PASSWORD = 'test-admin-password-2026';
 const TEST_JUDICIAL_KEY = 'test-judicial-access-key-2026-at-least-thirty-two-characters';
 
 function testEnvironment(port, dataDir) {
-  return { ...process.env, SENTINELQ_STORAGE_PROVIDER: 'local', PORT: port, SENTINELQ_DATA_DIR: dataDir, SENTINELQ_RATE_LIMIT_MULTIPLIER: '10', SENTINELQ_SEED_DEMO: '0', SENTINELQ_STORAGE_KEY: 'test-storage-key-2026-at-least-thirty-two-characters', SENTINELQ_AUDIT_KEY: 'test-audit-key-2026-at-least-thirty-two-characters', SENTINELQ_ADMIN_PASSWORD: TEST_ADMIN_PASSWORD, SENTINELQ_JUDICIAL_ACCESS_KEY: TEST_JUDICIAL_KEY, SENTINELQ_INVESTIGATOR_PASSWORD: 'test-investigator-password-2026', SENTINELQ_AUDITOR_PASSWORD: 'test-auditor-password-2026', SENTINELQ_MANAGER_PASSWORD: 'test-manager-password-2026' };
+  return { ...process.env, SENTINELQ_SKIP_ENV_FILE: '1', ...court.environment, SENTINELQ_STORAGE_PROVIDER: 'local', PORT: port, SENTINELQ_DATA_DIR: dataDir, SENTINELQ_RATE_LIMIT_MULTIPLIER: '10', SENTINELQ_SEED_DEMO: '0', SENTINELQ_STORAGE_KEY: 'test-storage-key-2026-at-least-thirty-two-characters', SENTINELQ_AUDIT_KEY: 'test-audit-key-2026-at-least-thirty-two-characters', SENTINELQ_ADMIN_PASSWORD: TEST_ADMIN_PASSWORD, SENTINELQ_JUDICIAL_ACCESS_KEY: TEST_JUDICIAL_KEY, SENTINELQ_INVESTIGATOR_PASSWORD: 'test-investigator-password-2026', SENTINELQ_AUDITOR_PASSWORD: 'test-auditor-password-2026', SENTINELQ_MANAGER_PASSWORD: 'test-manager-password-2026' };
 }
 
 function request(method, pathname, body, token, extraHeaders = {}) {
@@ -114,7 +115,7 @@ test('anonymization and chat endpoints work', async (t) => {
     assert.ok([401, 404].includes(originalDenied.statusCode), `Expected 401 or 404 for unauthorized evidence access, got ${originalDenied.statusCode}`);
   const directAccess = await request('GET', `/cases/${encodeURIComponent(video.body.id)}/evidence/${encodeURIComponent(video.body.files[0].originalArtifact)}`, null, token);
   assert.equal(directAccess.statusCode, 403);
-  const access = await request('POST', `/cases/${encodeURIComponent(video.body.id)}/evidence/${encodeURIComponent(video.body.files[0].name)}/original-access`, { key: TEST_JUDICIAL_KEY, reason: 'Judicial review of the source video evidence' }, token);
+  const access = await request('POST', `/cases/${encodeURIComponent(video.body.id)}/evidence/${encodeURIComponent(video.body.files[0].name)}/original-access`, await court.releaseBody(request, `/cases/${video.body.id}/evidence/${video.body.files[0].name}`, token, 'Judicial review of the source video evidence'), token);
   assert.equal(access.statusCode, 200);
   const originalAccess = await request('GET', `/cases/${encodeURIComponent(video.body.id)}/evidence/${encodeURIComponent(video.body.files[0].originalArtifact)}`, null, token, { 'X-Original-Grant': access.body.grant });
   assert.equal(originalAccess.statusCode, 200);

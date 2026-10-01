@@ -31,7 +31,9 @@ for (const caseFile of fs.readdirSync(DATA_DIR).filter(name => /^CASE-[A-Z0-9-]+
           const plaintext = decrypt(value, OLD_KEY, '');
           atomicWrite(artifactPath, encrypt(plaintext, NEW_KEY, aad));
           report.artifacts += 1;
-        } else if (value.subarray(0, 4).toString() === 'SQE2') {
+          } else if (value.subarray(0, 4).toString() === 'SQC1') {
+            require('./court-vault').readEnvelope(value, aad);
+          } else if (value.subarray(0, 4).toString() === 'SQE2') {
           decrypt(value, NEW_KEY, aad);
         } else {
           atomicWrite(artifactPath, encrypt(value, NEW_KEY, aad));

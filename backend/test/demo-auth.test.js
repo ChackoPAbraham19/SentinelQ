@@ -9,7 +9,7 @@ test('admin/admin demo exception refuses production and non-loopback startup', (
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sentinelq-demo-auth-'));
   try {
     const base = {
-      ...process.env, SENTINELQ_STORAGE_PROVIDER: 'local',
+      ...process.env, SENTINELQ_SKIP_ENV_FILE: '1', SENTINELQ_STORAGE_PROVIDER: 'local',
       SENTINELQ_DATA_DIR: dataDir,
       SENTINELQ_SEED_DEMO: '0',
       SENTINELQ_STORAGE_KEY: 'test-storage-key-2026-at-least-thirty-two-characters',

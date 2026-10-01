@@ -6,16 +6,19 @@ const os = require('os');
 const { execFile } = require('child_process');
 const { createStorage, StorageError } = require('./storage');
 const { createFrontend } = require('./frontend');
+const courtVault = require('./court-vault');
 
-loadEnvFile(path.join(__dirname, '.env'));
-loadEnvFile(path.join(__dirname, '..', '.env'));
+if (process.env.SENTINELQ_SKIP_ENV_FILE !== '1') {
+  loadEnvFile(path.join(__dirname, '.env'));
+  loadEnvFile(path.join(__dirname, '..', '.env'));
+}
 
 const DATA_DIR = path.resolve(process.env.SENTINELQ_DATA_DIR || path.join(__dirname, 'data'));
 const vault = createStorage(process.env, DATA_DIR);
 
 const MAX_REQUEST_BYTES = 12 * 1024 * 1024;
 const MAX_FILE_BYTES = 8 * 1024 * 1024;
-const PRIVACY_DERIVATIVE_VERSION = 2;
+const PRIVACY_DERIVATIVE_VERSION = 3;
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || process.env.RENDER_EXTERNAL_URL || 'http://localhost:3000';
 const serveFrontend = process.env.SENTINELQ_SERVE_FRONTEND === '1' ? createFrontend(path.join(__dirname, '..', 'frontend', 'dist')) : null;
 const HOST = process.env.HOST || '127.0.0.1';
@@ -28,6 +31,7 @@ const RATE_LIMIT_MULTIPLIER = Number.isFinite(configuredRateMultiplier) ? Math.m
 const sessions = new Map();
 const evidenceLinks = new Map();
 const originalGrants = new Map();
+const courtRequests = new Map();
 const rateBuckets = new Map();
 let lastRatePruneAt = 0;
 const ROLE_PERMISSIONS = Object.freeze({
@@ -70,7 +74,7 @@ function clientKey(req){
 }
 
 function rateLimited(req, res){
-  const routeClass = req.url.startsWith('/auth/login') || req.url.includes('/original-access') || req.url.includes('/judicial-details') ? 'login'
+  const routeClass = req.url.startsWith('/auth/login') || req.url.includes('/original-access') || req.url.includes('/court-request') || req.url.includes('/judicial-details') ? 'login'
     : req.url.startsWith('/track') ? 'recovery'
       : req.url.startsWith('/report') ? 'report'
         : req.url.startsWith('/ai/') ? 'ai'
@@ -150,7 +154,21 @@ function pruneEvidenceLinks(){
 
 function pruneOriginalGrants(){
   const now = Date.now();
-  for (const [token, grant] of originalGrants) if (now > grant.expiresAt) originalGrants.delete(token);
+  for (const [token, grant] of originalGrants) if (now > grant.expiresAt) { grant.dataKey?.fill(0); originalGrants.delete(token); }
+  for (const [id, entry] of courtRequests) if (now > entry.request.expiresAt) courtRequests.delete(id);
+}
+const grantCleanup = setInterval(pruneOriginalGrants, 10000);
+grantCleanup.unref();
+
+function consumeOriginalGrant(req, session, id, file) {
+  const token = String(req.headers['x-original-grant'] || '');
+  const grant = originalGrants.get(token);
+  originalGrants.delete(token);
+  if (!grant || grant.session !== session || grant.caseId !== id || grant.artifact !== file.originalArtifact || Date.now() > grant.expiresAt) {
+    grant?.dataKey?.fill(0);
+    return null;
+  }
+  return grant;
 }
 
 function judicialKeyValid(candidate){
@@ -390,6 +408,7 @@ function redactCase(caseObj, { includeMessages = false, includeNotes = false } =
     processingError: file.processingError,
     transformations: file.transformations,
     maskedCopyAvailable: canDownloadMaskedCopy(file),
+    originalProtection: file.originalProtection || 'LEGACY_SERVER_KEY',
     encrypted: file.encrypted
   }));
   if (!includeNotes) delete next.notes;
@@ -480,6 +499,8 @@ async function handleRequest(req, res) {
     if (session) await auditEvent('LOGOUT', session);
     const token = (req.headers.authorization || '').replace(/^Bearer\s+/, '');
     sessions.delete(token);
+    for (const [id, entry] of courtRequests) if (entry.session === session) courtRequests.delete(id);
+    for (const [id, grant] of originalGrants) if (grant.session === session) { grant.dataKey?.fill(0); originalGrants.delete(id); }
     return sendJson(res, { ok: true });
   }
 
@@ -497,9 +518,9 @@ async function handleRequest(req, res) {
   if (req.method === 'GET' && pathname === '/capabilities') {
     return sendJson(res, {
       ok: true,
-      implemented: ['pseudonymous-report', 'high-entropy-recovery-key', 'aes-256-gcm', 'sha3-256', 'image-metadata-strip', 'rbac', 'signed-audit-chain', 'signed-local-integrity-ledger', 'rule-based-privacy-advisory'],
+      implemented: ['pseudonymous-report', 'high-entropy-recovery-key', 'aes-256-gcm', 'sha3-256', 'image-metadata-strip', 'rbac', 'signed-audit-chain', 'signed-local-integrity-ledger', 'rule-based-privacy-advisory', 'full-frame-blur', 'voice-alteration', 'court-sealed-originals', 'court-signed-release'],
       prototype: ['one-time-evidence-link', 'coarse-aggregate-counts'],
-      notImplemented: ['network-anonymity', 'ml-kem', 'ml-dsa', 'zkp', 'hyperledger', 'face-blur', 'speaker-anonymization', 'dead-man-release', 'malware-scanner']
+      notImplemented: ['network-anonymity', 'ml-kem', 'ml-dsa', 'zkp', 'hyperledger', 'selective-face-detection', 'guaranteed-speaker-anonymization', 'spoken-identifier-redaction', 'dead-man-release', 'malware-scanner']
     });
   }
 
@@ -651,7 +672,10 @@ async function handleRequest(req, res) {
           const safeName = `${id}-${crypto.randomUUID()}`;
           const originalName = `${safeName}.original`;
           const sanitizedName = `${safeName}.sanitized`;
-          await vault.writeArtifact(originalName, encryptBuffer(buf, `evidence:${id}:${originalName}`));
+          let courtPublicKey;
+          try { courtPublicKey = courtVault.publicKeyFromEnvironment(); }
+          catch (error) { const failure = new Error('Evidence intake requires an independent court custodian public key. Contact the platform operator.'); failure.status = 503; throw failure; }
+          await vault.writeArtifact(originalName, courtVault.sealOriginal(buf, `evidence:${id}:${originalName}`, courtPublicKey));
           createdArtifactPaths.push(originalName);
           let privacyResult = null;
           if (isImage || isVideo || isAudio) privacyResult = await processMediaPrivacy(buf, isVideo ? 'video' : isAudio ? 'audio' : 'image');
@@ -672,6 +696,7 @@ async function handleRequest(req, res) {
             name: sanitizedName,
             original: name,
             originalArtifact: originalName,
+            originalProtection: 'COURT_SEALED',
             size: buf.length,
             mime,
             originalHash,
@@ -1017,9 +1042,13 @@ async function handleRequest(req, res) {
     const isText = file.mime === 'text/plain';
     if (!isVideo && !isAudio && !isImage && !isText) return sendJson(res, { ok: false, error: 'supported evidence required' }, 400);
     if (canDownloadMaskedCopy(file)) return sendJson(res, { ok: false, error: 'masked copy already exists' }, 409);
+    const releaseGrant = consumeOriginalGrant(req, session, id, file);
+    if (!releaseGrant) return sendJson(res, { ok: false, error: 'A court release and one-time original grant are required to reprocess evidence' }, 403);
     (async () => {
       try {
-        const original = decryptBuffer(await vault.readArtifact(file.originalArtifact), `evidence:${id}:${file.originalArtifact}`);
+        const stored = await vault.readArtifact(file.originalArtifact);
+        const context = `evidence:${id}:${file.originalArtifact}`;
+        const original = courtVault.isSealed(stored) ? courtVault.openOriginal(stored, context, releaseGrant.dataKey) : decryptBuffer(stored, context);
         if (computeHash(original) !== file.originalHash) throw new Error('original integrity mismatch');
         const processed = isText
           ? { status: 'COMPLETE', buffer: maskTextEvidence(original), error: null, transformations: ['TEXT_CONTENT_MASKED'] }
@@ -1047,9 +1076,38 @@ async function handleRequest(req, res) {
         return sendJson(res, { ok: true, case: redactCase(caseObj) });
       } catch (error) {
         return sendJson(res, { ok: false, error: 'media reprocessing failed' }, 500);
+      } finally {
+        releaseGrant.dataKey?.fill(0);
       }
     })();
     return;
+  }
+
+  if (req.method === 'POST' && /^\/cases\/[^/]+\/evidence\/[^/]+\/court-request$/.test(pathname)) {
+    const parts = pathname.split('/').filter(Boolean);
+    const id = safeDecode(parts[1], res);
+    const identifier = safeDecode(parts[3], res);
+    if (id === null || identifier === null) return;
+    const caseObj = await loadCaseById(id);
+    if (!caseObj) return sendJson(res, { ok: false, error: 'not found' }, 404);
+    const session = requirePermission(req, res, 'evidence:original', caseObj);
+    if (!session) return;
+    const file = findEvidence(caseObj, identifier);
+    if (!file) return sendJson(res, { ok: false, error: 'evidence not found' }, 404);
+    try {
+      pruneOriginalGrants();
+      if (courtRequests.size >= 5000) return sendJson(res, { ok: false, error: 'court request capacity reached' }, 503);
+      const publicKey = courtVault.publicKeyFromEnvironment();
+      const stored = await vault.readArtifact(file.originalArtifact);
+      if (!stored) throw new Error('missing original');
+      const context = `evidence:${id}:${file.originalArtifact}`;
+      const envelope = courtVault.isSealed(stored) ? courtVault.readEnvelope(stored, context).header : null;
+      if (envelope && envelope.keyId !== courtVault.keyId(publicKey)) throw new Error('court key mismatch');
+      const request = { version: 1, requestId: crypto.randomBytes(32).toString('base64url'), caseId: id, artifact: file.originalArtifact, context, keyId: courtVault.keyId(publicKey), wrappedKey: envelope?.wrappedKey || null, admin: session.username, expiresAt: Date.now() + 10 * 60 * 1000 };
+      await auditEvent('COURT_RELEASE_REQUESTED', session, id, { evidenceId: evidencePublicId(id, file.name), requestId: request.requestId });
+      courtRequests.set(request.requestId, { request, session });
+      return sendJson(res, { ok: true, request });
+    } catch (error) { return sendJson(res, { ok: false, error: 'Court public key or original unavailable. The configured key must match the original custodian.' }, 503); }
   }
 
   if (req.method === 'POST' && /^\/cases\/[^/]+\/evidence\/[^/]+\/original-access$/.test(pathname)) {
@@ -1067,15 +1125,23 @@ async function handleRequest(req, res) {
       if (error) return sendJson(res, { ok: false, error: 'invalid json' }, 400);
       const reason = String(obj.reason || '').trim();
       const evidenceId = evidencePublicId(id, file.name);
-      if (reason.length < 20 || reason.length > 500 || !judicialKeyValid(obj.key)) {
+      let release;
+      const entry = typeof obj.requestId === 'string' ? courtRequests.get(obj.requestId) : null;
+      try {
+        if (reason.length < 20 || reason.length > 500 || !entry || entry.session !== session || entry.request.caseId !== id || entry.request.artifact !== file.originalArtifact) throw new Error('invalid request');
+        release = courtVault.verifyRelease(obj.release, entry.request, courtVault.publicKeyFromEnvironment());
+      } catch (error) {
         await auditEvent('ORIGINAL_ACCESS_DENIED', session, id, { evidenceId });
-        return sendJson(res, { ok: false, error: 'valid judicial key and a reason of 20–500 characters required' }, 403);
+        return sendJson(res, { ok: false, error: 'A valid court-signed release for this session and evidence, plus a reason of 20–500 characters, is required' }, 403);
       }
+      // Consume synchronously before any await, preventing concurrent replay. Restart discards requests.
+      courtRequests.delete(obj.requestId);
       pruneOriginalGrants();
-      if (originalGrants.size >= 5000) return sendJson(res, { ok: false, error: 'original access capacity reached' }, 503);
+      if (originalGrants.size >= 5000) { release.dataKey?.fill(0); return sendJson(res, { ok: false, error: 'original access capacity reached' }, 503); }
       const grant = crypto.randomBytes(32).toString('base64url');
-      originalGrants.set(grant, { session, caseId: id, artifact: file.originalArtifact, expiresAt: Date.now() + 60000 });
-      await auditEvent('ORIGINAL_ACCESS_GRANTED', session, id, { evidenceId, reason });
+      try { await auditEvent('ORIGINAL_ACCESS_GRANTED', session, id, { evidenceId, reason, orderReference: release.orderReference, requestId: obj.requestId }); }
+      catch (error) { release.dataKey?.fill(0); return sendJson(res, { ok: false, error: 'Access audit unavailable' }, 503); }
+      originalGrants.set(grant, { session, caseId: id, artifact: file.originalArtifact, dataKey: release.dataKey, expiresAt: Math.min(Date.now() + 60000, release.expiresAt) });
       return sendJson(res, { ok: true, grant, expiresInSeconds: 60 });
     });
     return;
@@ -1093,11 +1159,10 @@ async function handleRequest(req, res) {
     const original = file.originalArtifact === fileName || new URL(req.url, 'http://localhost').searchParams.get('original') === '1';
     const session = requirePermission(req, res, original ? 'evidence:original' : 'evidence:read', caseObj);
     if (!session) return;
+    let releaseGrant;
     if (original) {
-      const grantToken = String(req.headers['x-original-grant'] || '');
-      const grant = originalGrants.get(grantToken);
-      originalGrants.delete(grantToken);
-      if (!grant || grant.session !== session || grant.caseId !== id || grant.artifact !== file.originalArtifact || Date.now() > grant.expiresAt) {
+      releaseGrant = consumeOriginalGrant(req, session, id, file);
+      if (!releaseGrant) {
         await auditEvent('ORIGINAL_ACCESS_DENIED', session, id, { evidenceId: evidencePublicId(id, file.name) });
         return sendJson(res, { ok: false, error: 'one-time original access grant required' }, 403);
       }
@@ -1106,10 +1171,11 @@ async function handleRequest(req, res) {
     }
     const artifactName = original ? file.originalArtifact : file.name;
     const evidencePath = path.join(DATA_DIR, artifactName);
-    const encryptedArtifact = await vault.readArtifact(artifactName);
-    if (!encryptedArtifact) return sendJson(res, { ok: false, error: 'evidence unavailable' }, 404);
     try {
-      const content = decryptBuffer(encryptedArtifact, `evidence:${id}:${artifactName}`);
+      const encryptedArtifact = await vault.readArtifact(artifactName);
+      if (!encryptedArtifact) return sendJson(res, { ok: false, error: 'evidence unavailable' }, 404);
+      const context = `evidence:${id}:${artifactName}`;
+      const content = original && courtVault.isSealed(encryptedArtifact) ? courtVault.openOriginal(encryptedArtifact, context, releaseGrant.dataKey) : decryptBuffer(encryptedArtifact, context);
       const expectedHash = original ? file.originalHash : (file.sanitizedHash || file.hash);
       if (!expectedHash || computeHash(content) !== expectedHash) throw new Error('evidence integrity mismatch');
       if (!original && await findLedgerHash(id, file.name) !== expectedHash) throw new Error('evidence ledger mismatch');
@@ -1119,6 +1185,8 @@ async function handleRequest(req, res) {
       return res.end(content);
     } catch (error) {
       return sendJson(res, { ok: false, error: 'evidence authentication failed' }, 409);
+    } finally {
+      releaseGrant?.dataKey?.fill(0);
     }
   }
 
@@ -1321,13 +1389,15 @@ async function processMediaPrivacy(buf, kind){
   const input = path.join(directory, 'source');
   try {
     await fs.promises.writeFile(input, buf, { mode: 0o600 });
-    const base = ['-v', 'error', '-nostdin', '-i', input];
-    const visualMask = 'scale=8:-2:flags=area,scale=480:-2:flags=neighbor';
+    const base = ['-v', 'error', '-nostdin', '-threads', '1', '-filter_threads', '1', '-protocol_whitelist', 'file,pipe', '-i', input, '-threads', '1'];
+    const visualMask = 'scale=8:-2:flags=area,scale=480:-2:flags=neighbor,gblur=sigma=12';
+    // Pitch/formant shift plus modulation; words remain audible and require content review.
+    const voiceMask = 'aresample=32000,asetrate=23040,aresample=32000,atempo=1.3888889,highpass=f=120,lowpass=f=3500,vibrato=f=7:d=0.6';
     const args = kind === 'video'
-      ? [...base, '-map', '0:v:0', '-vf', `${visualMask},format=yuv420p`, '-an', '-map_metadata', '-1', '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '30', '-f', 'mp4', '-movflags', 'frag_keyframe+empty_moov', 'pipe:1']
+      ? [...base, '-map', '0:v:0', '-map', '0:a:0?', '-vf', `${visualMask},format=yuv420p`, '-af', voiceMask, '-map_metadata', '-1', '-map_chapters', '-1', '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '30', '-c:a', 'aac', '-ac', '1', '-f', 'mp4', '-movflags', 'frag_keyframe+empty_moov', 'pipe:1']
       : kind === 'image'
         ? [...base, '-map', '0:v:0', '-frames:v', '1', '-vf', visualMask, '-map_metadata', '-1', '-c:v', 'png', '-f', 'image2pipe', 'pipe:1']
-        : [...base, '-map', '0:a:0', '-af', 'aeval=0.1*sin(2*PI*880*t)', '-map_metadata', '-1', '-c:a', 'pcm_s16le', '-ar', '16000', '-ac', '1', '-f', 'wav', 'pipe:1'];
+        : [...base, '-map', '0:a:0', '-af', voiceMask, '-map_metadata', '-1', '-map_chapters', '-1', '-c:a', 'pcm_s16le', '-ar', '16000', '-ac', '1', '-f', 'wav', 'pipe:1'];
     const output = await new Promise((resolve, reject) => {
       execFile(process.env.SENTINELQ_FFMPEG_PATH || 'ffmpeg', args, { encoding: 'buffer', maxBuffer: 32 * 1024 * 1024, timeout: 60000, windowsHide: true }, (error, stdout) => error ? reject(error) : resolve(stdout));
     });
@@ -1335,8 +1405,8 @@ async function processMediaPrivacy(buf, kind){
       : kind === 'image' ? output.subarray(0, 8).toString('hex') === '89504e470d0a1a0a'
         : output.subarray(0, 4).toString() === 'RIFF';
     if (!Buffer.isBuffer(output) || output.length < (kind === 'video' ? 128 : 44) || !signatureValid) throw new Error('invalid derivative');
-    const transformations = kind === 'video' ? ['FULL_FRAME_PIXEL_MASK', 'AUDIO_REMOVED']
-      : kind === 'image' ? ['FULL_FRAME_PIXEL_MASK', 'METADATA_REMOVED'] : ['VOICE_REPLACED_WITH_TONE'];
+    const transformations = kind === 'video' ? ['FULL_FRAME_BLUR', 'VOICE_ALTERED_IF_PRESENT', 'METADATA_REMOVED', 'SPOKEN_IDENTIFIERS_NOT_REDACTED']
+      : kind === 'image' ? ['FULL_FRAME_BLUR', 'METADATA_REMOVED'] : ['VOICE_ALTERED', 'METADATA_REMOVED', 'SPOKEN_IDENTIFIERS_NOT_REDACTED'];
     return { status: 'COMPLETE', buffer: output, error: null, transformations };
   } catch (error) {
     return { status: 'FAILED', buffer: null, error: 'Privacy processing unavailable; original remains restricted.', transformations: [] };

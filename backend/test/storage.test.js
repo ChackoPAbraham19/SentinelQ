@@ -31,7 +31,10 @@ test('only encrypted bytes can be uploaded, without filenames or public URLs', a
   await assert.rejects(storage.writeArtifact('CASE-TEST-001.original', Buffer.from('private plaintext')), /Only encrypted/);
   await assert.rejects(storage.writeArtifact('../secrets.original', Buffer.from('SQE2cipher')), /Invalid evidence/);
   await storage.writeArtifact('CASE-TEST-001.original', Buffer.from('SQE2cipher'));
-  assert.equal(called, 1);
+  const { sealOriginal } = require('../court-vault');
+  const { keys } = require('../test-support/court');
+  await storage.writeArtifact('CASE-TEST-001.original', sealOriginal(Buffer.from('private recording'), 'evidence:CASE-TEST:source.original', keys.publicKey));
+  assert.equal(called, 2);
 });
 test('provider failures fail closed and do not disclose response bodies or secrets', async () => {
   const storage = new SupabaseStorage(env, async () => json({ error: env.SUPABASE_SECRET_KEY }, 403));

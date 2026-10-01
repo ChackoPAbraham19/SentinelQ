@@ -8,3 +8,6 @@ frontend/dist/
 *.zip
 *.log
 .render/
+court-private.pem
+court-release*.txt
+court-request*.json

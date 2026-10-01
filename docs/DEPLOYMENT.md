@@ -39,11 +39,14 @@ SUPABASE_SECRET_KEY=<existing backend key>
 SENTINELQ_STORAGE_KEY=<existing storage key>
 SENTINELQ_AUDIT_KEY=<existing audit key>
 SENTINELQ_JUDICIAL_ACCESS_KEY=<existing judicial key>
+SENTINELQ_COURT_PUBLIC_KEY=<independent custodian public PEM; never the private key>
 ```
 
 The service uses Render's `RENDER_EXTERNAL_URL` as its allowed origin. Do not copy the localhost `ALLOWED_ORIGIN` or local `PORT` into Render. For a custom domain, set `ALLOWED_ORIGIN` to its exact HTTPS origin. The public Node port must remain behind Render's trusted HTTPS proxy. `/readyz` returns only a boolean for internal HTTP health probes; application endpoints require HTTPS.
 
 Authority password hashes are already in Supabase and do not need re-bootstrap passwords on Render. Optional external AI settings should only be copied when deliberately used; localhost AI endpoints are unavailable from Render. Never regenerate the storage or audit keys during deployment.
+
+The evidence privacy release adds full-frame blur, voice alteration, and court-sealed originals. Before accepting attachments, obtain the public key from an independent custodian using [the custody setup procedure](EVIDENCE_PRIVACY.md). Without a valid public key, evidence uploads fail closed with HTTP 503; reports without attachments remain available. A platform-generated or platform-held private key does not satisfy independent custody. Existing originals retain their previous encryption pending an explicit migration. Original download and reprocessing now require a signed court release instead of the old shared judicial key; the old key continues to gate sensitive case fields.
 
 ## Verification and operation
 

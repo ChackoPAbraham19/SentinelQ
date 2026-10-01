@@ -10,13 +10,13 @@ SentinelQ is a prototype for pseudonymous incident reporting, recovery-key case 
 - Audit records form an HMAC-signed chain. This detects offline modification by an actor who does not possess the audit key; it is not an externally witnessed transparency log.
 - Authority access uses PBKDF2 password verification, expiring opaque sessions, RBAC, assignment checks, bounded inputs, and per-route rate limits.
 - Reporter access uses a high-entropy recovery key. Legacy word-based recovery records remain supported through asynchronous verification.
-- JPEG/PNG images and MP4/WebM videos receive a coarse full-frame pixel mask; video audio is removed. WAV/MP3/M4A/OGG audio receives a generated tone in place of speech. TXT review copies replace non-whitespace characters with `X`. Originals remain encrypted. PDF and failed media processing remain quarantined, and older unmasked derivatives cannot be downloaded until reprocessed.
-- Sensitive case fields and original evidence require an admin session, a separate judicial access key, and a 20–500 character reason. Case details clear from the browser view after 60 seconds. Original downloads require an additional single-use 60-second grant. Access is audit logged; the key is server-side only.
+- JPEG/PNG images and MP4/WebM videos receive a coarse full-frame blur, including faces. Audio files and video audio use an altered voice while retaining speech; spoken identifiers are not redacted. TXT copies replace non-whitespace with `X`. PDF and processing failures remain quarantined.
+- New originals are AES-GCM encrypted with per-file keys wrapped to an independent custodian’s RSA public key. Only the custodian holds the private key. Original downloads/reprocessing require an admin session, a court-signed release, a recorded reason, and a one-use grant lasting at most 60 seconds. Sensitive case fields retain the separate judicial-key gate. See [custodian setup and release procedure](docs/EVIDENCE_PRIVACY.md).
 - Similar reports are shown only as review candidates. They never raise the evidence-integrity score or count as independent corroboration.
 
 ## Explicit limitations
 
-- No network anonymity, onion routing, traffic-analysis protection, PQC, ZKP, differential privacy, malware scanner, selective face detection, reversible voice disguise, or working dead-man release mechanism is provided. Media derivatives deliberately sacrifice detail for privacy; they are not substitutes for the original in evidentiary analysis.
+- No network anonymity, onion routing, traffic-analysis protection, PQC, ZKP, differential privacy, malware scanner, selective face detection, guaranteed speaker anonymization, spoken-identifier redaction, or working dead-man release mechanism is provided. Media derivatives deliberately sacrifice detail for privacy; they are not substitutes for the original in evidentiary analysis.
 - A deployment host, reverse proxy, network observer, compromised browser, or administrator can still observe metadata.
 - The rule-based privacy helper is advisory and cannot guarantee that text is anonymous.
 - Production deployment requires HTTPS, a trusted reverse proxy, managed key storage, coordinated case/object/audit transactions, backups, monitoring, and an independently anchored audit service. Sessions, download grants, and rate limits remain in process memory; run one Node instance until those are moved to shared storage.
@@ -25,7 +25,7 @@ SentinelQ is a prototype for pseudonymous incident reporting, recovery-key case 
 
 The ignored `backend/.env` must define unique values of at least the documented lengths. The server fails closed when passwords or keys are missing or use known placeholders.
 For this local demo, `admin` / `admin` can be enabled with `SENTINELQ_ALLOW_DEMO_ADMIN=1` in `backend/.env`. This exception works only when the backend binds to loopback, the frontend origin is local, and `NODE_ENV` is not `production`. Remove the flag and use a unique 16-character-or-longer password before deployment.
-Set `SENTINELQ_JUDICIAL_ACCESS_KEY` to a separate random value of at least 32 characters. If it is absent, sensitive case details and original evidence cannot be unlocked. Install FFmpeg on the backend host or set `SENTINELQ_FFMPEG_PATH`; media that cannot be processed stays restricted. Existing image, video, audio, and text evidence can be reprocessed from the admin console. PDF requires manual redaction before a review copy can be released.
+Configure `SENTINELQ_COURT_PUBLIC_KEY` or `SENTINELQ_COURT_PUBLIC_KEY_PATH` with the independent custodian’s public key before accepting evidence. Uploads with attachments fail closed without it. Never configure the custodian private key on this server. Set `SENTINELQ_JUDICIAL_ACCESS_KEY` separately for sensitive case fields. Install FFmpeg or set `SENTINELQ_FFMPEG_PATH`. Admin reprocessing requires a court release. Existing originals retain legacy encryption until an explicit custody migration; no existing data or backups are rewritten automatically. See [evidence privacy](docs/EVIDENCE_PRIVACY.md) for setup, limitations, and verification.
 
 ```powershell
 cd backend
@@ -73,9 +73,10 @@ Set `SUPABASE_URL`, `SUPABASE_SECRET_KEY`, and the existing application keys in 
 - `GET /cases`, `GET /cases/:id` — RBAC-filtered authority review.
 - `GET /cases/:id/verify` — artifact-by-artifact cryptographic verification.
 - `GET /cases/:id/verification` — custody-integrity summary plus non-scoring similarity leads.
-- `POST /cases/:id/evidence/:id/reprocess` — admin-only masked derivative creation for older image, video, audio, or text evidence.
+- `POST /cases/:id/evidence/:id/reprocess` — court-authorized masked derivative creation using a one-use original grant.
 - `POST /cases/:id/judicial-details` — admin key and reason check for sensitive case fields and original evidence metadata.
-- `POST /cases/:id/evidence/:id/original-access` — admin key and reason check; returns a one-use grant.
+- `POST /cases/:id/evidence/:id/court-request` — admin exports a session-bound request for independent custodian approval.
+- `POST /cases/:id/evidence/:id/original-access` — validates a court-signed release and reason; returns a one-use grant.
 - `GET /cases/:id/evidence/:id?original=1` — original download with the grant in `X-Original-Grant`.
 - `GET /audit` — verified audit-chain events.
 - `POST /ai/analyze` — authority-only; external processing requires explicit per-request consent.

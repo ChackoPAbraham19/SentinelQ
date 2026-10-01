@@ -6,6 +6,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { isDeepStrictEqual } = require('node:util');
 const { SupabaseStorage, LocalStorage } = require('./storage');
+const courtVault = require('./court-vault');
 const { encryptBuffer, decryptBuffer, encryptCaseFields, decryptCaseFields, verifySignedLines, loadAuthorityUsers } = require('./index_no_deps');
 
 async function main() {
@@ -38,7 +39,10 @@ async function main() {
           if (name === file.originalArtifact || (name === file.name && file.sanitizedHash)) throw Error('A referenced evidence artifact is missing');
           continue;
         }
-        decryptBuffer(bytes, `evidence:${item.id}:${name}`);
+        const context = `evidence:${item.id}:${name}`;
+        // Court ciphertext can only be authenticated in full after a custodian release.
+        if (name === file.originalArtifact && courtVault.isSealed(bytes)) courtVault.readEnvelope(bytes, context);
+        else decryptBuffer(bytes, context);
       }
     }
   }
@@ -59,7 +63,11 @@ async function main() {
         if (!bytes) continue;
         const remote = await cloud.readArtifact(name);
         if (remote && !remote.equals(bytes)) throw Error('Cloud evidence differs; refusing to overwrite');
-        if (!remote) await cloud.writeArtifact(name, bytes);
+        if (!remote) {
+          await cloud.writeArtifact(name, bytes);
+          const uploaded = await cloud.readArtifact(name);
+          if (!uploaded?.equals(bytes)) throw Error('Evidence copy verification failed');
+        }
         objects++;
       }
     }

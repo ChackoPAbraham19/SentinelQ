@@ -1,4 +1,5 @@
 const test = require('node:test');
+const court = require('../test-support/court');
 const assert = require('node:assert/strict');
 const { spawn } = require('node:child_process');
 const path = require('node:path');
@@ -9,7 +10,7 @@ const os = require('node:os');
 const TEST_ADMIN_PASSWORD = 'test-admin-password-2026';
 
 function testEnvironment(port, dataDir) {
-  return { ...process.env, SENTINELQ_STORAGE_PROVIDER: 'local', PORT: port, SENTINELQ_DATA_DIR: dataDir, SENTINELQ_RATE_LIMIT_MULTIPLIER: '10', SENTINELQ_SEED_DEMO: '0', SENTINELQ_STORAGE_KEY: 'test-storage-key-2026-at-least-thirty-two-characters', SENTINELQ_AUDIT_KEY: 'test-audit-key-2026-at-least-thirty-two-characters', SENTINELQ_ADMIN_PASSWORD: TEST_ADMIN_PASSWORD, SENTINELQ_INVESTIGATOR_PASSWORD: 'test-investigator-password-2026', SENTINELQ_AUDITOR_PASSWORD: 'test-auditor-password-2026', SENTINELQ_MANAGER_PASSWORD: 'test-manager-password-2026' };
+  return { ...process.env, ...court.environment, SENTINELQ_SKIP_ENV_FILE: '1', SENTINELQ_STORAGE_PROVIDER: 'local', PORT: port, SENTINELQ_DATA_DIR: dataDir, SENTINELQ_RATE_LIMIT_MULTIPLIER: '10', SENTINELQ_SEED_DEMO: '0', SENTINELQ_STORAGE_KEY: 'test-storage-key-2026-at-least-thirty-two-characters', SENTINELQ_AUDIT_KEY: 'test-audit-key-2026-at-least-thirty-two-characters', SENTINELQ_ADMIN_PASSWORD: TEST_ADMIN_PASSWORD, SENTINELQ_INVESTIGATOR_PASSWORD: 'test-investigator-password-2026', SENTINELQ_AUDITOR_PASSWORD: 'test-auditor-password-2026', SENTINELQ_MANAGER_PASSWORD: 'test-manager-password-2026' };
 }
 
 function request(method, pathname, body, token) {

@@ -184,7 +184,7 @@ test('media derivatives mask images, video, text and speech while keeping encryp
   assert.equal((await request('GET', `/cases/${pdf.body.id}/evidence/${pdfView.body.case.files[0].name}`, null, token)).status, 409);
 
   const additionalMedia = [
-    ['sample.webm', videoPath, ['-c:v', 'libvpx', '-c:a', 'libvorbis'], 'video/mp4'],
+    ['sample.webm', videoPath, ['-c:v', 'libvpx', '-c:a', 'libopus'], 'video/mp4'],
     ['sample.mp3', audioPath, ['-c:a', 'libmp3lame'], 'audio/wav'],
     ['sample.m4a', audioPath, ['-c:a', 'aac'], 'audio/wav'],
     ['sample.ogg', audioPath, ['-c:a', 'libvorbis'], 'audio/wav'],
@@ -194,9 +194,11 @@ test('media derivatives mask images, video, text and speech while keeping encryp
     const converted = spawnSync(ffmpeg, ['-y', '-v', 'error', '-i', source, ...codec, path.join(directory, name)], { windowsHide: true });
     assert.equal(converted.status, 0, converted.stderr?.toString());
   }
-  const formats = await request('POST', '/report-base64', { title: 'Additional media formats', description: 'Review copy formats', files: additionalMedia.map(([name]) => ({
-    name, data: fs.readFileSync(path.join(directory, name)).toString('base64')
-  })) });
+  const { evidenceFileBase64 } = await import('../../frontend/src/capture.mjs');
+  const formatFiles = await Promise.all(additionalMedia.map(async ([name]) => ({
+    name, data: await evidenceFileBase64(new File([fs.readFileSync(path.join(directory, name))], name, { type: name.endsWith('.webm') ? 'video/webm;codecs=vp8,opus' : 'application/octet-stream' }))
+  })));
+  const formats = await request('POST', '/report-base64', { title: 'Additional media formats', description: 'Review copy formats', files: formatFiles });
   assert.equal(formats.status, 200, JSON.stringify(formats.body));
   const formatView = await request('GET', `/cases/${formats.body.id}`, null, token);
   for (const [index, [, , , expectedMime]] of additionalMedia.entries()) {

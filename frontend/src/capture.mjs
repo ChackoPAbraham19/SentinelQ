@@ -1,4 +1,14 @@
 export const MAX_EVIDENCE_BYTES = 8 * 1024 * 1024;
+// Encode file bytes directly: recorded MIME types can contain commas (vp8,opus).
+export async function evidenceFileBase64(file) {
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  const chunks = [];
+  for (let offset = 0; offset < bytes.length; offset += 32768) {
+    chunks.push(String.fromCharCode(...bytes.subarray(offset, offset + 32768)));
+  }
+  return btoa(chunks.join(''));
+}
+
 export function evidenceError(files) {
   if (files.length > 5) return 'You can attach up to five evidence files.';
   if (files.some(file => !file.size || file.size > MAX_EVIDENCE_BYTES)) return 'Each evidence file must contain data and be no larger than 8 MiB.';

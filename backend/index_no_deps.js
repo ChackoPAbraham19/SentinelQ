@@ -701,13 +701,14 @@ async function handleRequest(req, res) {
         const warnings = checkPrivacy(`${title} ${description}`);
         const savedFiles = [];
         for (const f of files){
+          if (!f || typeof f !== 'object') throw new EvidenceValidationError('INVALID_EVIDENCE_ENCODING', 'An attachment was not transferred correctly. Please attach it again.');
           const { name = 'file.bin', data: b64 = '' } = f;
-          if (typeof b64 !== 'string' || b64.length === 0 || b64.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(b64)) throw new Error('invalid evidence encoding');
+          if (typeof b64 !== 'string' || b64.length === 0 || b64.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(b64)) throw new EvidenceValidationError('INVALID_EVIDENCE_ENCODING', 'An attachment was not transferred correctly. Please attach it again. If it was recorded here, save your report details, reload the page, and record again.');
           const buf = Buffer.from(b64, 'base64');
-          if (buf.toString('base64') !== b64) throw new Error('non-canonical evidence encoding');
-          if (!buf.length || buf.length > MAX_FILE_BYTES) { const failure = new Error('evidence file too large or empty'); failure.status = 413; throw failure; }
+          if (buf.toString('base64') !== b64) throw new EvidenceValidationError('INVALID_EVIDENCE_ENCODING', 'An attachment was not transferred correctly. Please attach it again.');
+          if (!buf.length || buf.length > MAX_FILE_BYTES) throw new EvidenceValidationError('EVIDENCE_SIZE_LIMIT', 'Each evidence file must contain data and be no larger than 8 MiB.', 413);
           const mimeCheck = inspectUpload(name, buf);
-          if (!mimeCheck.ok) throw new Error(mimeCheck.error);
+          if (!mimeCheck.ok) throw new EvidenceValidationError('INVALID_EVIDENCE_FORMAT', mimeCheck.error === 'unsupported file type' ? 'Unsupported attachment type. Use JPEG, PNG, MP4, WebM, WAV, MP3, M4A, OGG, PDF or TXT.' : 'An attachment does not match its file format or is damaged. Please attach the original file or record again.');
           const originalHash = computeHash(buf);
           let outBuf = buf;
           let metadataRemoved = false;
@@ -723,7 +724,7 @@ async function handleRequest(req, res) {
             else if (/\.png$/i.test(name)) { outBuf = stripPngTextChunks(buf); metadataSanitized = true; }
             metadataRemoved = metadataSanitized && outBuf.length !== buf.length;
           }catch(e){
-            throw new Error('evidence could not be safely parsed and sanitized');
+            throw new EvidenceValidationError('INVALID_EVIDENCE_FORMAT', 'An image could not be read safely. Please attach the original image or take another photo.');
           }
           const safeName = `${id}-${crypto.randomUUID()}`;
           const originalName = `${safeName}.original`;
@@ -817,11 +818,12 @@ async function handleRequest(req, res) {
             try { await vault.removeArtifact(artifactPath); } catch (cleanupError) {}
           }
         }
-        return sendJson(
-          res,
-          { ok: false, error: processingError.status === 413 ? processingError.message : processingError instanceof StorageError ? 'Secure storage unavailable. Please try again.' : 'evidence rejected by security validation' },
-          processingError instanceof StorageError ? processingError.status : (processingError.status || 400)
-        );
+        if (processingError instanceof EvidenceValidationError) return sendJson(res, { ok: false, error: processingError.message, code: processingError.code }, processingError.status);
+        const reference = crypto.randomUUID();
+        const storageFailure = processingError instanceof StorageError;
+        // Do not log report contents, filenames, media bytes or credentials.
+        console.error(JSON.stringify({ event: 'REPORT_SUBMISSION_FAILED', reference, kind: storageFailure ? 'storage' : 'internal' }));
+        return sendJson(res, { ok: false, error: `${storageFailure ? 'Secure storage unavailable.' : 'The report could not be saved because of a server error.'} Please try again. Reference: ${reference}`, code: storageFailure ? 'STORAGE_UNAVAILABLE' : 'REPORT_SAVE_FAILED', reference }, storageFailure ? processingError.status : 500);
       }
     }, MAX_REQUEST_BYTES);
     return;
@@ -1416,6 +1418,14 @@ function computeHash(buf){
 function mimeForName(name){
   const extension = path.extname(String(name)).toLowerCase();
   return ({ '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png', '.pdf': 'application/pdf', '.mp4': 'video/mp4', '.webm': 'video/webm', '.weba': 'audio/webm', '.wav': 'audio/wav', '.mp3': 'audio/mpeg', '.m4a': 'audio/mp4', '.ogg': 'audio/ogg', '.txt': 'text/plain' })[extension] || null;
+}
+
+class EvidenceValidationError extends Error {
+  constructor(code, message, status = 400) {
+    super(message);
+    this.code = code;
+    this.status = status;
+  }
 }
 
 function inspectUpload(name, buf){

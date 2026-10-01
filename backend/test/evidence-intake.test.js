@@ -39,6 +39,17 @@ for (const [label, publicKey] of [['missing', ''], ['invalid', 'invalid-public-k
     const readiness = await fetch(base + '/evidence-intake');
     assert.deepEqual(await readiness.json(), { ok: true, ready: true });
     const report = { title: 'Intake regression test', description: 'Synthetic local test report', files: [{ name: 'note.txt', data: Buffer.from('Synthetic evidence').toString('base64') }] };
+    for (const [file, code] of [
+      [{ name: 'capture.webm', data: 'opus;base64' }, 'INVALID_EVIDENCE_ENCODING'],
+      [{ name: 'capture.webm', data: Buffer.from('not a webm').toString('base64') }, 'INVALID_EVIDENCE_FORMAT'],
+      [{ name: 'file.exe', data: Buffer.from('unsupported').toString('base64') }, 'INVALID_EVIDENCE_FORMAT']
+    ]) {
+      const invalid = await fetch(base + '/report-base64', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...report, files: [file] }) });
+      assert.equal(invalid.status, 400);
+      const failure = await invalid.json();
+      assert.equal(failure.code, code);
+      assert.doesNotMatch(failure.error, /security validation/);
+    }
     const response = await fetch(base + '/report-base64', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(report) });
     assert.equal(response.status, 200);
     const body = await response.json();

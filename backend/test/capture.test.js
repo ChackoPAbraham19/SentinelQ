@@ -2,6 +2,16 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const capture = import('../../frontend/src/capture.mjs');
 
+test('evidence upload preserves binary bytes for recorded MIME types containing commas', async () => {
+  const { evidenceFileBase64, MAX_EVIDENCE_BYTES } = await capture;
+  const bytes = Buffer.alloc(MAX_EVIDENCE_BYTES);
+  for (let i = 0; i < bytes.length; i++) bytes[i] = i % 256;
+  for (const type of ['video/webm;codecs=vp8,opus', 'video/mp4;codecs=avc1,mp4a', 'audio/webm;codecs=opus', 'image/jpeg']) {
+    const file = new File([bytes], 'capture.webm', { type });
+    assert.deepEqual(Buffer.from(await evidenceFileBase64(file), 'base64'), bytes, type);
+  }
+});
+
 function fixture(options = {}) {
   const state = { tracksStopped: 0, states: [], captures: [], errors: [], streams: [] };
   const track = { stop: () => state.tracksStopped++, addEventListener: (event, callback) => { state.interrupted = callback; } };

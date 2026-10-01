@@ -2,7 +2,7 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 import axios from "axios";
 import OriginalAccess, { ViewerAccount, AuditPhoto } from './ViewerAccess';
 import EvidenceCapture from "./EvidenceCapture";
-import { evidenceError as validateEvidence, MAX_EVIDENCE_BYTES } from "./capture.mjs";
+import { evidenceError as validateEvidence, evidenceFileBase64, MAX_EVIDENCE_BYTES } from "./capture.mjs";
 
 const API =
   window.SENTINELQ_CONFIG?.apiBaseUrl ||
@@ -507,14 +507,8 @@ export default function App() {
         anonymizedDescription: acceptedAnonymized ? anonymizedDescription : "",
         files: [],
       };
-      for (const f of files) {
-        const file = f;
-        const b64 = await new Promise((resolve, reject) => {
-          const r = new FileReader();
-          r.onload = () => resolve(r.result.split(",")[1]);
-          r.onerror = reject;
-          r.readAsDataURL(file);
-        });
+      for (const file of files) {
+        const b64 = await evidenceFileBase64(file);
         toSend.files.push({ name: file.name, data: b64 });
       }
       const res = await axios.post(`${API}/report-base64`, toSend);

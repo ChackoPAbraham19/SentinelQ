@@ -6,6 +6,14 @@ Render dashboard: https://dashboard.render.com/web/srv-daukri7pn0mc738359kg
 
 Workspace: Festin's workspace. Service: `srv-daukri7pn0mc738359kg`. Initial deployed commit: `ace483fde1a13cde7fa6d99ac672235d66856429`. Blueprint: `exs-daukprl9fdbs739bnvtg`.
 
+## Evidence privacy release — October 1, 2026
+
+Commit `01b9194466ed2222e44cc0c9103b76015ba31719` deployed successfully as `dep-dausdnh7lnhs739p0h90`. Public health and capabilities endpoints returned HTTP 200, and the live frontend displayed the independent-custodian access explanation. All 62 local tests and the frontend build passed before release.
+
+At the user's explicit request, 85 mock evidence attachments and 155 original/review-copy storage objects were removed. Independent database verification confirmed zero remaining evidence attachments/objects, with all 193 cases preserved. The signed audit history was retained and verified, including cleanup events. This cleanup applies to the hosted store; historical local migration copies and external backups were not modified.
+
+The custodian public key was not configured at release time. The user authorized deployment with new evidence uploads locked until that key is supplied. Text-only report intake remains available; no replacement or platform-held court private key was generated.
+
 Verified on the public HTTPS deployment: homepage, security headers, blocked secret-file routes, authority login/logout, reporter recovery, two-way messages, photo/MP4/TXT/PDF encrypted uploads, review masking/quarantine, byte-for-byte original retrieval with one-use grants, private storage URLs, revision conflicts, and signed history. The synthetic check case and seven test objects were removed afterward; signed audit records remain. The local suite passed all 60 tests before deployment.
 
 One free Render Node web service serves the built frontend and API on the same HTTPS origin. Supabase continues storing the encrypted cases and attachments in Mumbai. Render's nearest supported service region is Singapore; application processing occurs there.

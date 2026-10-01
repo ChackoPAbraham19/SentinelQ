@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import axios from "axios";
-import { CustodyAdmin } from './CustodianSetup';
+import OriginalAccess, { ViewerAccount, AuditPhoto } from './ViewerAccess';
 import EvidenceCapture from "./EvidenceCapture";
 import { evidenceError as validateEvidence, MAX_EVIDENCE_BYTES } from "./capture.mjs";
 
@@ -119,7 +119,7 @@ function GettingStarted({ onStart, onTrack }) {
         <div><p className="section-eyebrow">GOOD TO KNOW</p><h2 id="help-heading">A little clarity<br /> before you share.</h2><p>You decide when you’re ready to begin.</p></div>
         <div className="help-questions">
           <details><summary>Do I need to share my identity?</summary><p>No reporter account is required. Avoid unnecessary identifying details in your title, description and files. The privacy helper is advisory; it cannot guarantee anonymity.</p></details>
-          <details><summary>Who can view my report and evidence?</summary><p>Case access is restricted to authorized reviewers. New original evidence is encrypted for an independent custodian; admins need a court-signed release to access it. Sensitive case details use a separate judicial access key. Messages are encrypted in storage, not end to end.</p></details>
+          <details><summary>Who can view my report and evidence?</summary><p>Case access is restricted to authorized reviewers. Original evidence requires an authorized court or admin account, that viewer’s personal key, and a recorded camera photo. Sensitive case details use a separate judicial access key. Messages are encrypted in storage, not end to end.</p></details>
           <details><summary>What if I need to leave quickly?</summary><p>Quick exit clears the current workspace and opens a blank page or the configured exit page. It does not erase browser history, downloaded files or network records. An unsent report will be lost.</p></details>
           <details><summary>How do I get back to my report?</summary><p>Choose Track a case and enter your Case ID and recovery key. Save both after submitting; a lost recovery key cannot be reset. You must return to the portal to check for messages.</p></details>
         </div>
@@ -410,7 +410,6 @@ export default function App() {
   const [files, setFiles] = useState([]);
   const [captureBusy, setCaptureBusy] = useState(false);
   const [attachmentError, setAttachmentError] = useState("");
-  const [evidenceIntake, setEvidenceIntake] = useState(null);
   const [result, setResult] = useState(null);
   const [activeView, setActiveView] = useState("welcome");
   const workspaceRef = useRef(null);
@@ -438,31 +437,12 @@ export default function App() {
   const [auditEvents, setAuditEvents] = useState([]);
   const [originalAccessFile, setOriginalAccessFile] = useState(null);
   const [judicialKey, setJudicialKey] = useState("");
-  const [courtRequest, setCourtRequest] = useState(null);
-  const [courtRelease, setCourtRelease] = useState("");
   const [accessReason, setAccessReason] = useState("");
   const [evidenceError, setEvidenceError] = useState("");
   const [evidenceBusy, setEvidenceBusy] = useState(false);
   const [detailsFormOpen, setDetailsFormOpen] = useState(false);
   const [judicialDetails, setJudicialDetails] = useState(null);
   const [detailsError, setDetailsError] = useState("");
-
-  const checkEvidenceIntake = async () => {
-    try {
-      const { data } = await axios.get(`${API}/evidence-intake`, { timeout: 15000 });
-      const status = data.ready === true ? { ready: true } : { ready: false, message: data.message || "Evidence uploads are temporarily unavailable. You can submit a report without attachments." };
-      setEvidenceIntake(status);
-      return status;
-    } catch {
-      const status = { ready: false, message: "Could not check evidence upload availability. Retry the check, or submit a report without attachments." };
-      setEvidenceIntake(status);
-      return status;
-    }
-  };
-
-  useEffect(() => {
-    if (activeView === "report") checkEvidenceIntake();
-  }, [activeView]);
 
   useEffect(() => {
     const titles = { welcome: "Getting started", report: "Submit a report", track: "Track a case", dashboard: "Authority access" };
@@ -521,10 +501,6 @@ export default function App() {
     if (error) { setAttachmentError(error); return; }
     setSubmitting(true);
     try {
-      if (files.length) {
-        const intake = await checkEvidenceIntake();
-        if (!intake.ready) { setResult({ error: intake.message }); return; }
-      }
       const toSend = {
         title,
         description: acceptedAnonymized ? anonymizedDescription : description,
@@ -619,47 +595,6 @@ export default function App() {
     link.click();
     link.remove();
     setTimeout(() => URL.revokeObjectURL(blobUrl), 1000);
-  };
-
-  useEffect(() => { setCourtRequest(null); setCourtRelease(""); }, [originalAccessFile, selectedCase?.id, authority?.token]);
-
-  const exportCourtRequest = async (file) => {
-    setEvidenceBusy(true);
-    setEvidenceError("");
-    setCourtRelease("");
-    setCourtRequest(null);
-    try {
-      const response = await axios.post(`${API}/cases/${encodeURIComponent(selectedCase.id)}/evidence/${encodeURIComponent(file.name)}/court-request`);
-      setCourtRequest(response.data.request);
-      const url = URL.createObjectURL(new Blob([JSON.stringify(response.data.request, null, 2)], { type: "application/json" }));
-      const link = document.createElement("a");
-      link.href = url;
-      link.download = `court-request-${selectedCase.id}.json`;
-      link.click();
-      setTimeout(() => URL.revokeObjectURL(url), 1000);
-    } catch (error) { setEvidenceError(error.response?.data?.error || "Court request failed"); }
-    finally { setEvidenceBusy(false); }
-  };
-
-  const openOriginal = async (event, file) => {
-    event.preventDefault();
-    setEvidenceError("");
-    setEvidenceBusy(true);
-    try {
-      const path = `${API}/cases/${encodeURIComponent(selectedCase.id)}/evidence/${encodeURIComponent(file.name)}/original-access`;
-      const response = await axios.post(path, { requestId: courtRequest?.requestId, release: courtRelease.trim(), reason: accessReason });
-      if (event.nativeEvent.submitter?.value === "reprocess") await reprocessEvidence(file, response.data.grant);
-      else await downloadEvidence(file, response.data.grant);
-      setAccessReason("");
-      setOriginalAccessFile(null);
-      loadAudit();
-    } catch (error) {
-      setEvidenceError(error.response?.data?.error || "Original access failed");
-    } finally {
-      setJudicialKey("");
-      setCourtRelease("");
-      setEvidenceBusy(false);
-    }
   };
 
   const unlockJudicialDetails = async (event) => {
@@ -1133,8 +1068,7 @@ export default function App() {
                     <span className="mono">OPTIONAL</span>
                   </div>
                   <h2 className="panel-title">Add supporting evidence.</h2>
-                  {!evidenceIntake?.ready && <div className="inline-warning" role="status"><p>{evidenceIntake?.message || "Checking evidence upload availability…"}</p>{evidenceIntake && <button type="button" onClick={checkEvidenceIntake}>Retry availability check</button>}</div>}
-                  <EvidenceCapture onAdd={addEvidence} onBusy={setCaptureBusy} disabled={submitting || files.length >= 5 || !evidenceIntake?.ready} remainingBytes={MAX_EVIDENCE_BYTES - files.reduce((sum, file) => sum + file.size, 0)} />
+                  <EvidenceCapture onAdd={addEvidence} onBusy={setCaptureBusy} disabled={submitting || files.length >= 5} remainingBytes={MAX_EVIDENCE_BYTES - files.reduce((sum, file) => sum + file.size, 0)} />
                   <label className="drop-zone">
                     <span className="drop-icon"><NavIcon name="upload" /></span>
                     <strong>Browse evidence files <span aria-hidden="true">↗</span></strong>
@@ -1145,7 +1079,7 @@ export default function App() {
                       type="file"
                       accept="image/jpeg,image/png,video/mp4,video/webm,audio/webm,audio/wav,audio/mpeg,audio/mp4,audio/ogg,.weba,.pdf,.txt"
                       multiple
-                      disabled={submitting || captureBusy || !evidenceIntake?.ready}
+                      disabled={submitting || captureBusy}
                       onChange={(e) => { addEvidence(Array.from(e.target.files)); e.target.value = ""; }}
                     />
                   </label>
@@ -1176,7 +1110,7 @@ export default function App() {
                           <p className="video-note" key={`${file.name}-note`}>
                             {file.type === "application/pdf"
                               ? "PDF evidence stays quarantined with no review copy. Its encrypted original requires judicial access."
-                              : "Images and video are blurred across the whole frame, including faces. Audio uses an altered voice. Spoken names and identifying details remain audible; avoid including them. Originals are encrypted for an independent court custodian."}
+                              : "Images and video are blurred across the whole frame, including faces. Audio uses an altered voice. Spoken names and identifying details remain audible; avoid including them. Originals are encrypted in storage. Authorized court or admin viewers must enter their personal key and record a photo before access."}
                           </p>
                         ))}
                     </div>
@@ -1212,7 +1146,7 @@ export default function App() {
                   />
                   <p>
                     Case records and masked evidence require an authenticated
-                    session. Originals require admin access and a signed release from an independent court custodian.
+                    session. Original viewing requires a court or admin account, a personal access key, and a camera photo.
                   </p>
                   <label>
                     Username
@@ -1262,7 +1196,7 @@ export default function App() {
                       Refresh data
                     </button>
                   </div>
-                  {authority.user.role === 'ADMIN' && <CustodyAdmin api={API} token={authority.token} />}
+                  {['ADMIN', 'COURT'].includes(authority.user.role) && <ViewerAccount api={API} authority={authority} />}
                   <div className="metric-strip">
                     {metrics.map((metric) => (
                       <div className="metric" key={metric.label}>
@@ -1414,7 +1348,7 @@ export default function App() {
                                 {selectedCase.files?.length || 0} ITEM(S)
                               </span>
                             </div>
-                            <p className="muted">Review copies blur faces and the surrounding scene and alter voices. Spoken identities may still be audible. New originals are encrypted for an independent court custodian whose private key is never held by the platform.</p>
+                            <p className="muted">Review copies blur faces and the surrounding scene and alter voices. Spoken identities may still be audible. Originals are encrypted in storage. Each original view requires the viewer’s personal key and a camera photo linked to the audit trail.</p>
                             {evidenceError && <p className="inline-warning" role="alert">{evidenceError}</p>}
                             {selectedCase.files?.map((file) => (
                               <div className="evidence-row" key={file.name}>
@@ -1426,7 +1360,7 @@ export default function App() {
                                   </span>
                                 </div>
                                 <small>{file.maskedCopyAvailable ? "Masked copy ready" : file.processingStatus === "QUARANTINED" ? "Quarantined" : "Masking required"}</small>
-                                <small>{file.originalProtection === "COURT_SEALED" ? "Original sealed to court custodian" : "Legacy original: server encryption; custody migration required"}</small>
+                                <small>{file.originalProtection === "COURT_SEALED" ? "Legacy sealed original: recovery required" : "Original restricted: personal key + viewer photo"}</small>
                                 {(file.mime?.startsWith("image/") || file.mime?.startsWith("video/") || file.mime?.startsWith("audio/")) && (
                                   <b
                                     className={
@@ -1446,19 +1380,9 @@ export default function App() {
                                 )}
                                 <div className="evidence-actions">
                                   {file.maskedCopyAvailable && <button type="button" onClick={() => downloadEvidence(file).catch(error => setEvidenceError(error.response?.data?.error || "Masked copy unavailable"))}>Download masked copy</button>}
-                                  {authority?.user?.role === "ADMIN" && <button type="button" onClick={() => { setOriginalAccessFile(file.name); setDetailsFormOpen(false); setJudicialDetails(null); setJudicialKey(""); setAccessReason(""); setEvidenceError(""); }}>Request original</button>}
+                                  {["ADMIN", "COURT"].includes(authority?.user?.role) && <button type="button" onClick={() => { setOriginalAccessFile(file.name); setDetailsFormOpen(false); setJudicialDetails(null); setJudicialKey(""); setAccessReason(""); setEvidenceError(""); }}>Request original</button>}
                                 </div>
-                                {authority?.user?.role === "ADMIN" && originalAccessFile === file.name && (
-                                  <form className="original-access-form" onSubmit={event => openOriginal(event, file)}>
-                                    <strong>Court-authorized access</strong>
-                                    <p>Send the request file to the independent custodian with the court order. After verifying the order, they issue a release for this file and your current session. Never enter the custodian’s private key here.</p>
-                                    <button type="button" disabled={evidenceBusy} onClick={() => exportCourtRequest(file)}>Export court request</button>
-                                    {courtRequest && <p role="status">Request expires at {new Date(courtRequest.expiresAt).toLocaleTimeString()}. The signed release lasts at most five minutes and can be redeemed once.</p>}
-                                    <label>Reason for access<textarea value={accessReason} onChange={event => setAccessReason(event.target.value)} minLength={20} maxLength={500} required placeholder="Describe the specific judicial need" /></label>
-                                    <label>Signed court release<input type="password" autoComplete="off" maxLength={8192} value={courtRelease} onChange={event => setCourtRelease(event.target.value)} required /></label>
-                                    <div className="evidence-actions"><button type="submit" value="download" disabled={evidenceBusy || !courtRequest}>{evidenceBusy ? "Checking…" : "Unlock once and download"}</button>{!file.maskedCopyAvailable && file.mime !== "application/pdf" && <button type="submit" value="reprocess" disabled={evidenceBusy || !courtRequest}>Authorize and create masked copy</button>}<button type="button" onClick={() => { setOriginalAccessFile(null); setCourtRelease(""); setCourtRequest(null); setAccessReason(""); }}>Cancel</button></div>
-                                  </form>
-                                )}
+                                {["ADMIN", "COURT"].includes(authority?.user?.role) && originalAccessFile === file.name && <OriginalAccess key={`${selectedCase.id}:${file.name}`} api={API} caseId={selectedCase.id} file={file} authority={authority} onClose={() => setOriginalAccessFile(null)} onAudit={loadAudit} onReprocess={reprocessEvidence} />}
                               </div>
                             ))}
                           </div>
@@ -1530,6 +1454,7 @@ export default function App() {
                           <small>
                             {event.caseId || event.actor || "system"}
                           </small>
+                          {event.event === 'ORIGINAL_ACCESS_GRANTED' && event.accessId && <AuditPhoto api={API} event={event} token={authority.token} />}
                         </div>
                       ))}
                     {auditEvents.length === 0 && (

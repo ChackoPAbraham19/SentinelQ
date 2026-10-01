@@ -236,3 +236,9 @@ a { color: var(--sq-primary-strong); text-underline-offset: 4px; }
 .custody-panel button, .custody-setup button { margin: 8px 12px 12px 0; min-height: 44px; }
 .custody-setup label { display: block; margin-top: 16px; }
 .custody-fingerprint { display: block; overflow-wrap: anywhere; }
+.viewer-photo-preview { display: block; max-width: 240px; max-height: 240px; margin: 12px 0; }
+.original-viewer { position: relative; background: #18252a; padding: 12px; color: #fff; overflow: hidden; }
+.original-viewer video, .original-viewer img, .original-viewer iframe { width: 100%; max-height: 600px; min-height: 240px; object-fit: contain; }
+.original-viewer audio { width: 100%; margin-top: 100px; }
+.original-viewer pre { white-space: pre-wrap; padding-top: 100px; }
+.viewer-watermark { position: absolute; top: 20%; left: 8%; right: 8%; z-index: 2; color: white; text-shadow: 0 1px 4px black; opacity: .8; font: 14px monospace; overflow-wrap: anywhere; pointer-events: none; }

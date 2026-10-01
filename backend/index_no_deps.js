@@ -7,7 +7,7 @@ const { execFile } = require('child_process');
 const { createStorage, StorageError } = require('./storage');
 const { createFrontend } = require('./frontend');
 const courtVault = require('./court-vault');
-const { CustodySetup } = require('./custody-setup');
+const { sanitizeViewerPhoto } = require('./viewer-photo');
 
 if (process.env.SENTINELQ_SKIP_ENV_FILE !== '1') {
   loadEnvFile(path.join(__dirname, '.env'));
@@ -16,11 +16,9 @@ if (process.env.SENTINELQ_SKIP_ENV_FILE !== '1') {
 
 const DATA_DIR = path.resolve(process.env.SENTINELQ_DATA_DIR || path.join(__dirname, 'data'));
 const vault = createStorage(process.env, DATA_DIR);
-const custodySetup = new CustodySetup(vault);
 
 const MAX_REQUEST_BYTES = 12 * 1024 * 1024;
 const MAX_FILE_BYTES = 8 * 1024 * 1024;
-const EVIDENCE_INTAKE_UNAVAILABLE = 'Evidence uploads are temporarily unavailable. Please try again later or submit a report without attachments. No key is needed from you.';
 const PRIVACY_DERIVATIVE_VERSION = 3;
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || process.env.RENDER_EXTERNAL_URL || 'http://localhost:3000';
 const serveFrontend = process.env.SENTINELQ_SERVE_FRONTEND === '1' ? createFrontend(path.join(__dirname, '..', 'frontend', 'dist')) : null;
@@ -34,11 +32,12 @@ const RATE_LIMIT_MULTIPLIER = Number.isFinite(configuredRateMultiplier) ? Math.m
 const sessions = new Map();
 const evidenceLinks = new Map();
 const originalGrants = new Map();
-const courtRequests = new Map();
+const viewerChallenges = new Map();
 const rateBuckets = new Map();
 let lastRatePruneAt = 0;
 const ROLE_PERMISSIONS = Object.freeze({
-  ADMIN: ['custody:setup', 'cases:read', 'cases:write', 'chat:read', 'chat:write', 'evidence:read', 'evidence:original', 'evidence:verify', 'audit:read', 'notes:read', 'notes:write', 'assign:write'],
+  ADMIN: ['courts:create', 'cases:read', 'cases:write', 'chat:read', 'chat:write', 'evidence:read', 'evidence:original', 'evidence:verify', 'audit:read', 'notes:read', 'notes:write', 'assign:write'],
+  COURT: ['cases:read', 'chat:read', 'evidence:read', 'evidence:original', 'evidence:verify'],
   CASE_MANAGER: ['cases:read', 'cases:write', 'chat:read', 'chat:write', 'evidence:read', 'evidence:verify', 'notes:read', 'notes:write', 'assign:write'],
   INVESTIGATOR: ['cases:read', 'chat:read', 'chat:write', 'evidence:read', 'evidence:verify', 'notes:read', 'notes:write'],
   AUDITOR: ['cases:read', 'evidence:read', 'evidence:verify', 'audit:read']
@@ -77,7 +76,7 @@ function clientKey(req){
 }
 
 function rateLimited(req, res){
-  const routeClass = req.url.startsWith('/auth/login') || req.url.includes('/original-access') || req.url.includes('/court-request') || req.url.includes('/judicial-details') ? 'login'
+  const routeClass = req.url.startsWith('/auth/login') || req.url.startsWith('/viewer-key') || req.url.includes('/original-access') || req.url.includes('/viewer-challenge') || req.url.includes('/court-request') || req.url.includes('/judicial-details') ? 'login'
     : req.url.startsWith('/track') ? 'recovery'
       : req.url.startsWith('/report') ? 'report'
         : req.url.startsWith('/ai/') ? 'ai'
@@ -158,7 +157,7 @@ function pruneEvidenceLinks(){
 function pruneOriginalGrants(){
   const now = Date.now();
   for (const [token, grant] of originalGrants) if (now > grant.expiresAt) { grant.dataKey?.fill(0); originalGrants.delete(token); }
-  for (const [id, entry] of courtRequests) if (now > entry.request.expiresAt) courtRequests.delete(id);
+  for (const [id, entry] of viewerChallenges) if (now > entry.expiresAt) viewerChallenges.delete(id);
 }
 const grantCleanup = setInterval(pruneOriginalGrants, 10000);
 grantCleanup.unref();
@@ -502,7 +501,7 @@ async function handleRequest(req, res) {
     if (session) await auditEvent('LOGOUT', session);
     const token = (req.headers.authorization || '').replace(/^Bearer\s+/, '');
     sessions.delete(token);
-    for (const [id, entry] of courtRequests) if (entry.session === session) courtRequests.delete(id);
+    for (const [id, entry] of viewerChallenges) if (entry.session === session) viewerChallenges.delete(id);
     for (const [id, grant] of originalGrants) if (grant.session === session) { grant.dataKey?.fill(0); originalGrants.delete(id); }
     return sendJson(res, { ok: true });
   }
@@ -518,54 +517,64 @@ async function handleRequest(req, res) {
     });
   }
 
-  if (req.method === 'GET' && pathname === '/evidence-intake') {
-    try {
-      await custodySetup.requirePublicKey();
-      return sendJson(res, { ok: true, ready: true });
-    } catch {
-      return sendJson(res, { ok: true, ready: false, code: 'EVIDENCE_INTAKE_UNAVAILABLE', message: EVIDENCE_INTAKE_UNAVAILABLE });
-    }
-  }
+  if (req.method === 'GET' && pathname === '/evidence-intake') return sendJson(res, { ok: true, ready: true });
 
-  if (req.method === 'GET' && pathname === '/custody/status') {
-    if (!requirePermission(req, res, 'custody:setup')) return;
-    try {
-      const key = await custodySetup.publicKey();
-      return sendJson(res, { ok: true, ready: !!key, keyId: key ? courtVault.keyId(key) : null });
-    } catch { return sendJson(res, { ok: false, error: 'Custody configuration could not be read. Check the configured key and secure storage.' }, 503); }
-  }
-
-  if (req.method === 'POST' && pathname === '/custody/invite') {
-    const session = requirePermission(req, res, 'custody:setup');
+  if (req.method === 'GET' && pathname === '/viewer-key') {
+    const session = requirePermission(req, res, 'evidence:original');
     if (!session) return;
-    try {
-      await auditEvent('CUSTODY_SETUP_INVITED', session);
-      const invite = await custodySetup.createInvite(session.username, ALLOWED_ORIGIN);
-      return sendJson(res, { ok: true, ...invite });
-    } catch { return sendJson(res, { ok: false, error: 'Setup cannot start. Custody may already be configured, or storage is unavailable.' }, 409); }
+    return sendJson(res, { ok: true, configured: !!await vault.getViewerKey(session.username) });
   }
-
-  if (req.method === 'POST' && ['/custody/check', '/custody/register'].includes(pathname)) {
+  if (req.method === 'POST' && pathname === '/viewer-key') {
+    const session = requirePermission(req, res, 'evidence:original');
+    if (!session) return;
     readJson(req, async (obj, error) => {
-      if (error) return sendJson(res, { ok: false, error: 'Invalid setup request' }, 400);
-      try {
-        if (pathname === '/custody/check') {
-          const invite = custodySetup.check(obj.token);
-          return sendJson(res, { ok: true, challenge: invite.challenge, expiresAt: invite.expiresAt });
-        }
-        if (Object.keys(obj).some(key => !['token', 'publicKey', 'proof'].includes(key))) throw new Error('Invalid enrollment fields');
-        const registration = await custodySetup.register(obj.token, obj.publicKey, obj.proof);
-        await auditEvent('CUSTODY_SETUP_COMPLETED', { username: registration.actor, role: 'ADMIN' }, null, { keyId: registration.keyId });
-        return sendJson(res, { ok: true, keyId: registration.keyId });
-      } catch { return sendJson(res, { ok: false, error: 'Setup could not be completed. Check the invitation and recovery file; custody may already be configured. Ask the administrator to check setup status before retrying.' }, 400); }
-    }, 12 * 1024);
+      if (error || typeof obj.password !== 'string' || obj.password.length > 256) return sendJson(res, { ok: false, error: 'Your account password is required' }, 400);
+      const user = AUTHORITY_USERS.find(user => user.username === session.username);
+      if (!user || !await new Promise(resolve => verifyPassword(obj.password, user.passwordHash, resolve))) return sendJson(res, { ok: false, error: 'Account password incorrect' }, 403);
+      if (await vault.getViewerKey(session.username)) return sendJson(res, { ok: false, error: 'Your personal access key is already configured. Use your saved key.' }, 409);
+      const key = crypto.randomBytes(32).toString('base64url');
+      const hash = hashPassword(key);
+      await auditEvent('VIEWER_KEY_CREATED', session);
+      if (await vault.registerViewerKey(session.username, hash) !== hash) return sendJson(res, { ok: false, error: 'Your personal access key is already configured.' }, 409);
+      return sendJson(res, { ok: true, key, warning: 'Save this personal access key securely. It is shown once and cannot be recovered.' });
+    }, 4096);
     return;
+  }
+  if (req.method === 'POST' && pathname === '/courts') {
+    const session = requirePermission(req, res, 'courts:create');
+    if (!session) return;
+    readJson(req, async (obj, error) => {
+      const username = typeof obj.username === 'string' ? obj.username.trim().toLowerCase() : '';
+      if (error || !/^[a-z][a-z0-9_-]{2,63}$/.test(username) || typeof obj.password !== 'string' || obj.password.length < 16 || obj.password.length > 256) return sendJson(res, { ok: false, error: 'Use a unique username (3–64 lowercase letters, digits, _ or -) and password of 16–256 characters.' }, 400);
+      if (AUTHORITY_USERS.some(user => user.username === username)) return sendJson(res, { ok: false, error: 'Username already exists' }, 409);
+      const user = { username, role: 'COURT', passwordHash: hashPassword(obj.password) };
+      await auditEvent('COURT_ACCOUNT_CREATED', session, null, { courtUsername: username });
+      try { await vault.createCourtAccount(user); }
+      catch (failure) { return sendJson(res, { ok: false, error: 'Court account could not be created. The username may already exist.' }, 409); }
+      AUTHORITY_USERS.push(user);
+      return sendJson(res, { ok: true, username, role: 'COURT' });
+    }, 4096);
+    return;
+  }
+  if (req.method === 'GET' && /^\/access-audits\/[a-f0-9-]{36}\/photo$/.test(pathname)) {
+    const session = requirePermission(req, res, 'audit:read');
+    if (!session) return;
+    const accessId = pathname.split('/')[2];
+    const lines = await vault.readLog('audit');
+    if (!verifySignedLines(lines)) return sendJson(res, { ok: false, error: 'Audit integrity check failed' }, 409);
+    const event = lines.map(line => JSON.parse(line)).find(event => event.event === 'ORIGINAL_ACCESS_GRANTED' && event.accessId === accessId);
+    if (!event) return sendJson(res, { ok: false, error: 'Photo not found' }, 404);
+    const photo = decryptBuffer(await vault.readArtifact(event.viewerPhotoArtifact), `viewer-photo:${accessId}`);
+    if (computeHash(photo) !== event.viewerPhotoHash) return sendJson(res, { ok: false, error: 'Photo integrity check failed' }, 409);
+    await auditEvent('VIEWER_PHOTO_REVIEWED', session, event.caseId, { accessId });
+    res.writeHead(200, { ...corsHeaders(), 'Content-Type': 'image/png' });
+    return res.end(photo);
   }
 
   if (req.method === 'GET' && pathname === '/capabilities') {
     return sendJson(res, {
       ok: true,
-      implemented: ['pseudonymous-report', 'high-entropy-recovery-key', 'aes-256-gcm', 'sha3-256', 'image-metadata-strip', 'rbac', 'signed-audit-chain', 'signed-local-integrity-ledger', 'rule-based-privacy-advisory', 'full-frame-blur', 'voice-alteration', 'court-sealed-originals', 'court-signed-release'],
+      implemented: ['pseudonymous-report', 'high-entropy-recovery-key', 'aes-256-gcm', 'sha3-256', 'image-metadata-strip', 'rbac', 'signed-audit-chain', 'signed-local-integrity-ledger', 'rule-based-privacy-advisory', 'full-frame-blur', 'voice-alteration', 'viewer-key-original-access', 'viewer-photo-audit', 'court-accounts'],
       prototype: ['one-time-evidence-link', 'coarse-aggregate-counts'],
       notImplemented: ['network-anonymity', 'ml-kem', 'ml-dsa', 'zkp', 'hyperledger', 'selective-face-detection', 'guaranteed-speaker-anonymization', 'spoken-identifier-redaction', 'dead-man-release', 'malware-scanner']
     });
@@ -684,13 +693,6 @@ async function handleRequest(req, res) {
         const { title = '', description = '', anonymizedDescription = '', files = [], regionBucket = '', deadManDays = 0, involved = '', incidentDate = '' } = obj;
         if (!String(title).trim() || !String(description).trim() || !Array.isArray(files) || files.length > 5 || String(title).length > 200 || String(description).length > 10000 || String(anonymizedDescription).length > 10000) return sendJson(res, { ok: false, error: 'invalid report fields' }, 400);
         if (Number(deadManDays) > 0) return sendJson(res, { ok: false, error: 'dead-man release is not implemented and cannot be enabled' }, 400);
-        let courtPublicKey;
-        if (files.length) {
-          try { courtPublicKey = await custodySetup.requirePublicKey(); }
-          catch {
-            return sendJson(res, { ok: false, code: 'EVIDENCE_INTAKE_UNAVAILABLE', error: EVIDENCE_INTAKE_UNAVAILABLE }, 503);
-          }
-        }
         const safeDescription = (anonymizedDescription || description || '').trim() || description;
         const id = generateCaseId();
         const reporterId = generateReporterId();
@@ -726,7 +728,7 @@ async function handleRequest(req, res) {
           const safeName = `${id}-${crypto.randomUUID()}`;
           const originalName = `${safeName}.original`;
           const sanitizedName = `${safeName}.sanitized`;
-          await vault.writeArtifact(originalName, courtVault.sealOriginal(buf, `evidence:${id}:${originalName}`, courtPublicKey));
+          await vault.writeArtifact(originalName, encryptBuffer(buf, `evidence:${id}:${originalName}`));
           createdArtifactPaths.push(originalName);
           let privacyResult = null;
           if (isImage || isVideo || isAudio) privacyResult = await processMediaPrivacy(buf, isVideo ? 'video' : isAudio ? 'audio' : 'image');
@@ -747,7 +749,7 @@ async function handleRequest(req, res) {
             name: sanitizedName,
             original: name,
             originalArtifact: originalName,
-            originalProtection: 'COURT_SEALED',
+            originalProtection: 'VIEWER_KEY_PHOTO',
             size: buf.length,
             mime,
             originalHash,
@@ -1094,7 +1096,7 @@ async function handleRequest(req, res) {
     if (!isVideo && !isAudio && !isImage && !isText) return sendJson(res, { ok: false, error: 'supported evidence required' }, 400);
     if (canDownloadMaskedCopy(file)) return sendJson(res, { ok: false, error: 'masked copy already exists' }, 409);
     const releaseGrant = consumeOriginalGrant(req, session, id, file);
-    if (!releaseGrant) return sendJson(res, { ok: false, error: 'A court release and one-time original grant are required to reprocess evidence' }, 403);
+    if (!releaseGrant) return sendJson(res, { ok: false, error: 'Your access key, viewer photo, and one-time original grant are required to reprocess evidence' }, 403);
     (async () => {
       try {
         const stored = await vault.readArtifact(file.originalArtifact);
@@ -1134,10 +1136,9 @@ async function handleRequest(req, res) {
     return;
   }
 
-  if (req.method === 'POST' && /^\/cases\/[^/]+\/evidence\/[^/]+\/court-request$/.test(pathname)) {
-    const parts = pathname.split('/').filter(Boolean);
-    const id = safeDecode(parts[1], res);
-    const identifier = safeDecode(parts[3], res);
+  if (req.method === 'POST' && /^\/cases\/[^/]+\/evidence\/[^/]+\/viewer-challenge$/.test(pathname)) {
+    const parts = pathname.split('/');
+    const id = safeDecode(parts[2], res), identifier = safeDecode(parts[4], res);
     if (id === null || identifier === null) return;
     const caseObj = await loadCaseById(id);
     if (!caseObj) return sendJson(res, { ok: false, error: 'not found' }, 404);
@@ -1145,26 +1146,18 @@ async function handleRequest(req, res) {
     if (!session) return;
     const file = findEvidence(caseObj, identifier);
     if (!file) return sendJson(res, { ok: false, error: 'evidence not found' }, 404);
-    try {
-      pruneOriginalGrants();
-      if (courtRequests.size >= 5000) return sendJson(res, { ok: false, error: 'court request capacity reached' }, 503);
-      const publicKey = await custodySetup.requirePublicKey();
-      const stored = await vault.readArtifact(file.originalArtifact);
-      if (!stored) throw new Error('missing original');
-      const context = `evidence:${id}:${file.originalArtifact}`;
-      const envelope = courtVault.isSealed(stored) ? courtVault.readEnvelope(stored, context).header : null;
-      if (envelope && envelope.keyId !== courtVault.keyId(publicKey)) throw new Error('court key mismatch');
-      const request = { version: 1, requestId: crypto.randomBytes(32).toString('base64url'), caseId: id, artifact: file.originalArtifact, context, keyId: courtVault.keyId(publicKey), wrappedKey: envelope?.wrappedKey || null, admin: session.username, expiresAt: Date.now() + 10 * 60 * 1000 };
-      await auditEvent('COURT_RELEASE_REQUESTED', session, id, { evidenceId: evidencePublicId(id, file.name), requestId: request.requestId });
-      courtRequests.set(request.requestId, { request, session });
-      return sendJson(res, { ok: true, request });
-    } catch (error) { return sendJson(res, { ok: false, error: 'Court public key or original unavailable. The configured key must match the original custodian.' }, 503); }
+    if (!await vault.getViewerKey(session.username)) return sendJson(res, { ok: false, error: 'Create your personal original-access key in your account first.' }, 409);
+    pruneOriginalGrants();
+    for (const [token, entry] of viewerChallenges) if (entry.session === session) viewerChallenges.delete(token);
+    if (viewerChallenges.size >= 5000) return sendJson(res, { ok: false, error: 'Access service busy' }, 503);
+    const challenge = crypto.randomBytes(32).toString('base64url');
+    viewerChallenges.set(challenge, { session, caseId: id, artifact: file.originalArtifact, expiresAt: Date.now() + 120000 });
+    return sendJson(res, { ok: true, challenge, expiresInSeconds: 120 });
   }
 
   if (req.method === 'POST' && /^\/cases\/[^/]+\/evidence\/[^/]+\/original-access$/.test(pathname)) {
-    const parts = pathname.split('/').filter(Boolean);
-    const id = safeDecode(parts[1], res);
-    const identifier = safeDecode(parts[3], res);
+    const parts = pathname.split('/');
+    const id = safeDecode(parts[2], res), identifier = safeDecode(parts[4], res);
     if (id === null || identifier === null) return;
     const caseObj = await loadCaseById(id);
     if (!caseObj) return sendJson(res, { ok: false, error: 'not found' }, 404);
@@ -1175,28 +1168,37 @@ async function handleRequest(req, res) {
     readJson(req, async (obj, error) => {
       if (error) return sendJson(res, { ok: false, error: 'invalid json' }, 400);
       const reason = String(obj.reason || '').trim();
+      const orderReference = String(obj.orderReference || '').trim();
       const evidenceId = evidencePublicId(id, file.name);
-      let release;
-      const entry = typeof obj.requestId === 'string' ? courtRequests.get(obj.requestId) : null;
-      try {
-        if (reason.length < 20 || reason.length > 500 || !entry || entry.session !== session || entry.request.caseId !== id || entry.request.artifact !== file.originalArtifact) throw new Error('invalid request');
-        release = courtVault.verifyRelease(obj.release, entry.request, await custodySetup.requirePublicKey());
-      } catch (error) {
+      const hash = await vault.getViewerKey(session.username);
+      const validKey = hash && typeof obj.key === 'string' && obj.key.length <= 256 && await new Promise(resolve => verifyPassword(obj.key, hash, resolve));
+      const challenge = typeof obj.challenge === 'string' ? viewerChallenges.get(obj.challenge) : null;
+      if (!validKey || !challenge || challenge.session !== session || challenge.caseId !== id || challenge.artifact !== file.originalArtifact || Date.now() > challenge.expiresAt || reason.length < 20 || reason.length > 500 || orderReference.length < 3 || orderReference.length > 160) {
         await auditEvent('ORIGINAL_ACCESS_DENIED', session, id, { evidenceId });
-        return sendJson(res, { ok: false, error: 'A valid court-signed release for this session and evidence, plus a reason of 20–500 characters, is required' }, 403);
+        return sendJson(res, { ok: false, error: 'Your personal access key, a fresh viewer photo, a case/order reference, and a reason of 20–500 characters are required.' }, 403);
       }
-      // Consume synchronously before any await, preventing concurrent replay. Restart discards requests.
-      courtRequests.delete(obj.requestId);
+      viewerChallenges.delete(obj.challenge);
+      if (file.originalProtection === 'COURT_SEALED') return sendJson(res, { ok: false, error: 'This older original needs its existing custodian recovery process before migration.' }, 409);
+      let photo;
+      try { photo = await sanitizeViewerPhoto(obj.photo); }
+      catch { return sendJson(res, { ok: false, error: 'A valid camera photo is required. Retake your photo; if this persists, photo processing may be unavailable.' }, 422); }
+      const accessId = crypto.randomUUID();
+      const photoArtifact = `VIEWER-${accessId}.photo`;
+      try {
+        await vault.writeArtifact(photoArtifact, encryptBuffer(photo, `viewer-photo:${accessId}`));
+        await auditEvent('ORIGINAL_ACCESS_GRANTED', session, id, { evidenceId, accessId, reason, orderReference, viewerPhotoArtifact: photoArtifact, viewerPhotoHash: computeHash(photo), identityVerification: 'PHOTO_RECORDED_NOT_IDENTITY_VERIFIED' });
+      } catch {
+        return sendJson(res, { ok: false, error: 'Access audit unavailable. No original was released.' }, 503);
+      }
       pruneOriginalGrants();
-      if (originalGrants.size >= 5000) { release.dataKey?.fill(0); return sendJson(res, { ok: false, error: 'original access capacity reached' }, 503); }
+      if (originalGrants.size >= 5000) return sendJson(res, { ok: false, error: 'original access capacity reached' }, 503);
       const grant = crypto.randomBytes(32).toString('base64url');
-      try { await auditEvent('ORIGINAL_ACCESS_GRANTED', session, id, { evidenceId, reason, orderReference: release.orderReference, requestId: obj.requestId }); }
-      catch (error) { release.dataKey?.fill(0); return sendJson(res, { ok: false, error: 'Access audit unavailable' }, 503); }
-      originalGrants.set(grant, { session, caseId: id, artifact: file.originalArtifact, dataKey: release.dataKey, expiresAt: Math.min(Date.now() + 60000, release.expiresAt) });
-      return sendJson(res, { ok: true, grant, expiresInSeconds: 60 });
-    });
+      originalGrants.set(grant, { session, caseId: id, artifact: file.originalArtifact, accessId, expiresAt: Date.now() + 60000 });
+      return sendJson(res, { ok: true, grant, accessId, viewer: session.username, expiresInSeconds: 60 });
+    }, 1500000);
     return;
   }
+
 
   if (req.method === 'GET' && pathname.startsWith('/cases/') && pathname.includes('/evidence/')) {
     const parts = pathname.split('/').filter(Boolean);
@@ -1231,7 +1233,7 @@ async function handleRequest(req, res) {
       if (!expectedHash || computeHash(content) !== expectedHash) throw new Error('evidence integrity mismatch');
       if (!original && await findLedgerHash(id, file.name) !== expectedHash) throw new Error('evidence ledger mismatch');
       const downloadName = original ? safeDownloadName(file.original) : maskedDownloadName(id, file);
-      if (original) await auditEvent('ORIGINAL_EVIDENCE_ACCESS', session, id, { evidenceId: evidencePublicId(id, file.name) });
+      if (original) await auditEvent('ORIGINAL_EVIDENCE_ACCESS', session, id, { evidenceId: evidencePublicId(id, file.name), accessId: releaseGrant.accessId });
       res.writeHead(200, { ...corsHeaders({ 'Content-Security-Policy': "sandbox; default-src 'none'" }), 'Content-Type': 'application/octet-stream', 'Content-Disposition': `attachment; filename="${downloadName}"` });
       return res.end(content);
     } catch (error) {
@@ -1312,7 +1314,8 @@ async function start() {
     value => decryptBuffer(Buffer.from(value, 'base64'), requireSecret('SENTINELQ_AUDIT_KEY', 32)).toString('utf8'),
   );
   const storedUsers = await vault.getAuthorities();
-  if (storedUsers?.length) AUTHORITY_USERS = storedUsers;
+  if (vault.provider === 'local') AUTHORITY_USERS = [...loadAuthorityUsers(), ...(storedUsers || [])];
+  else if (storedUsers?.length) AUTHORITY_USERS = storedUsers;
   else {
     if (vault.provider === 'supabase' && process.env.SENTINELQ_ADMIN_PASSWORD === 'admin') throw new Error('Cloud storage requires a unique admin password of at least 16 characters; demo credentials are disabled');
     AUTHORITY_USERS = await vault.bootstrapAuthorities(loadAuthorityUsers());

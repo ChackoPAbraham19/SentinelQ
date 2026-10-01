@@ -1,4 +1,4 @@
-const court = require('../test-support/court');
+const viewer = require('../test-support/viewer');
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { spawn, spawnSync } = require('node:child_process');
@@ -48,7 +48,7 @@ test('media derivatives mask images, video, text and speech while keeping encryp
   const sourceText = Buffer.from('Witness Jane Doe called from 123 Main Street.\nKeep this private.');
 
   const server = spawn(process.execPath, [path.join(__dirname, '..', 'index_no_deps.js')], { cwd: path.join(__dirname, '..'), env: {
-    ...process.env, SENTINELQ_SKIP_ENV_FILE: '1', ...court.environment, SENTINELQ_STORAGE_PROVIDER: 'local', PORT: '4103', SENTINELQ_DATA_DIR: path.join(directory, 'data'), SENTINELQ_SEED_DEMO: '0', SENTINELQ_RATE_LIMIT_MULTIPLIER: '10',
+    ...process.env, SENTINELQ_SKIP_ENV_FILE: '1', SENTINELQ_COURT_PUBLIC_KEY: '', SENTINELQ_COURT_PUBLIC_KEY_PATH: '', SENTINELQ_STORAGE_PROVIDER: 'local', PORT: '4103', SENTINELQ_DATA_DIR: path.join(directory, 'data'), SENTINELQ_SEED_DEMO: '0', SENTINELQ_RATE_LIMIT_MULTIPLIER: '10',
     SENTINELQ_STORAGE_KEY: 'test-storage-key-2026-at-least-thirty-two-characters',
     SENTINELQ_AUDIT_KEY: 'test-audit-key-2026-at-least-thirty-two-characters',
     SENTINELQ_ADMIN_PASSWORD: 'test-admin-password-2026', SENTINELQ_JUDICIAL_ACCESS_KEY: key,
@@ -136,7 +136,7 @@ test('media derivatives mask images, video, text and speech while keeping encryp
 
   const originalDenied = await request('GET', `/cases/${report.body.id}/evidence/${caseView.body.case.files[2].name}?original=1`, null, token);
   assert.equal(originalDenied.status, 403);
-  const grant = await request('POST', `/cases/${report.body.id}/evidence/${caseView.body.case.files[2].name}/original-access`, await court.releaseBody(request, `/cases/${report.body.id}/evidence/${caseView.body.case.files[2].name}`, token), token);
+  const grant = await request('POST', `/cases/${report.body.id}/evidence/${caseView.body.case.files[2].name}/original-access`, await viewer.accessBody(request, `/cases/${report.body.id}/evidence/${caseView.body.case.files[2].name}`, token), token);
   assert.equal(grant.status, 200, JSON.stringify(grant.body));
   const originalImage = await request('GET', `/cases/${report.body.id}/evidence/${caseView.body.case.files[2].name}?original=1`, null, token, { 'X-Original-Grant': grant.body.grant });
   assert.equal(originalImage.status, 200);
@@ -154,7 +154,7 @@ test('media derivatives mask images, video, text and speech while keeping encryp
   assert.equal((await request('GET', `/cases/${report.body.id}/evidence/${caseView.body.case.files[2].name}`, null, token)).status, 409);
   assert.equal((await request('POST', `/cases/${report.body.id}/evidence-link`, { fileName: caseView.body.case.files[2].name }, token)).status, 404);
   assert.equal((await request('POST', `/cases/${report.body.id}/evidence/${caseView.body.case.files[2].name}/reprocess`, {}, token)).status, 403);
-  const imageRelease = await request('POST', `/cases/${report.body.id}/evidence/${caseView.body.case.files[2].name}/original-access`, await court.releaseBody(request, `/cases/${report.body.id}/evidence/${caseView.body.case.files[2].name}`, token), token);
+  const imageRelease = await request('POST', `/cases/${report.body.id}/evidence/${caseView.body.case.files[2].name}/original-access`, await viewer.accessBody(request, `/cases/${report.body.id}/evidence/${caseView.body.case.files[2].name}`, token), token);
   const repairedImage = await request('POST', `/cases/${report.body.id}/evidence/${caseView.body.case.files[2].name}/reprocess`, null, token, { 'X-Original-Grant': imageRelease.body.grant });
   assert.equal(repairedImage.status, 200, JSON.stringify(repairedImage.body));
   assert.equal(repairedImage.body.case.files[2].maskedCopyAvailable, true);
@@ -167,7 +167,7 @@ test('media derivatives mask images, video, text and speech while keeping encryp
   legacyVideo.files[1].privacyVersion = null;
   legacyVideo.files[1].processingStatus = 'FAILED';
   fs.writeFileSync(storedCasePath, JSON.stringify(legacyVideo));
-  const videoRelease = await request('POST', `/cases/${report.body.id}/evidence/${caseView.body.case.files[1].name}/original-access`, await court.releaseBody(request, `/cases/${report.body.id}/evidence/${caseView.body.case.files[1].name}`, token), token);
+  const videoRelease = await request('POST', `/cases/${report.body.id}/evidence/${caseView.body.case.files[1].name}/original-access`, await viewer.accessBody(request, `/cases/${report.body.id}/evidence/${caseView.body.case.files[1].name}`, token), token);
   const reprocessed = await request('POST', `/cases/${report.body.id}/evidence/${caseView.body.case.files[1].name}/reprocess`, null, token, { 'X-Original-Grant': videoRelease.body.grant });
   assert.equal(reprocessed.status, 200, JSON.stringify(reprocessed.body));
   assert.equal(reprocessed.body.case.files[1].processingStatus, 'COMPLETE');
@@ -209,11 +209,11 @@ test('media derivatives mask images, video, text and speech while keeping encryp
   }
   const capturedAudio = formatView.body.case.files[4];
   assert.equal(capturedAudio.mime, 'audio/webm');
-  assert.equal(capturedAudio.originalProtection, 'COURT_SEALED');
+  assert.equal(capturedAudio.originalProtection, 'VIEWER_KEY_PHOTO');
   assert.ok(capturedAudio.transformations.includes('VOICE_ALTERED'));
   const capturedRoute = `/cases/${formats.body.id}/evidence/${capturedAudio.name}`;
   assert.equal((await request('GET', `${capturedRoute}?original=1`, null, token)).status, 403);
-  const capturedGrant = await request('POST', `${capturedRoute}/original-access`, await court.releaseBody(request, capturedRoute, token), token);
+  const capturedGrant = await request('POST', `${capturedRoute}/original-access`, await viewer.accessBody(request, capturedRoute, token), token);
   assert.equal(capturedGrant.status, 200);
   const capturedOriginal = await request('GET', `${capturedRoute}?original=1`, null, token, { 'X-Original-Grant': capturedGrant.body.grant });
   assert.equal(capturedOriginal.status, 200);

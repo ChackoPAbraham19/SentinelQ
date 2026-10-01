@@ -8,13 +8,13 @@ const path = require('node:path');
 const os = require('node:os');
 
 for (const [label, publicKey] of [['missing', ''], ['invalid', 'invalid-public-key']]) {
-  test(`${label} custody configuration explains the block, stores no evidence, and permits text reports`, async t => {
+  test(`${label} custodian configuration does not block evidence submissions`, async t => {
     const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sentinelq-intake-'));
     const server = spawn(process.execPath, [path.join(__dirname, '..', 'index_no_deps.js')], {
       env: {
         ...process.env, SENTINELQ_SKIP_ENV_FILE: '1', SENTINELQ_STORAGE_PROVIDER: 'local',
         PORT: '4118', HOST: '127.0.0.1', SENTINELQ_REQUIRE_HTTPS: '0', SENTINELQ_SERVE_FRONTEND: '0',
-        SENTINELQ_DATA_DIR: dataDir, SENTINELQ_SEED_DEMO: '0',
+        SENTINELQ_DATA_DIR: dataDir, SENTINELQ_SEED_DEMO: '0', SENTINELQ_RATE_LIMIT_MULTIPLIER: '10',
         SENTINELQ_COURT_PUBLIC_KEY: publicKey, SENTINELQ_COURT_PUBLIC_KEY_PATH: '',
         SENTINELQ_STORAGE_KEY: 'test-storage-key-2026-at-least-thirty-two-characters',
         SENTINELQ_AUDIT_KEY: 'test-audit-key-2026-at-least-thirty-two-characters',
@@ -36,58 +36,66 @@ for (const [label, publicKey] of [['missing', ''], ['invalid', 'invalid-public-k
       await new Promise(resolve => setTimeout(resolve, 100));
     }
     assert.ok(started, output);
-    const readiness = await fetch(`${base}/evidence-intake`);
-    assert.match(readiness.headers.get('cache-control'), /no-store/);
-    const status = await readiness.json();
-    assert.equal(status.ready, false);
-    assert.equal(status.code, 'EVIDENCE_INTAKE_UNAVAILABLE');
-    const before = fs.readdirSync(dataDir).sort();
+    const readiness = await fetch(base + '/evidence-intake');
+    assert.deepEqual(await readiness.json(), { ok: true, ready: true });
     const report = { title: 'Intake regression test', description: 'Synthetic local test report', files: [{ name: 'note.txt', data: Buffer.from('Synthetic evidence').toString('base64') }] };
-    const blocked = await fetch(`${base}/report-base64`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(report) });
-    assert.equal(blocked.status, 503);
-    const error = await blocked.json();
-    assert.equal(error.code, status.code);
-    assert.equal(error.error, status.message);
-    assert.match(error.error, /No key is needed from you/);
-    assert.doesNotMatch(error.error, /rejected by security validation/);
-    assert.deepEqual(fs.readdirSync(dataDir).sort(), before);
-    const accepted = await fetch(`${base}/report-base64`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...report, files: [] }) });
-    assert.equal(accepted.status, 200);
-    assert.equal((await accepted.json()).ok, true);
+    const response = await fetch(base + '/report-base64', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(report) });
+    assert.equal(response.status, 200);
+    const body = await response.json();
+    assert.equal(body.ok, true);
+    assert.equal(body.files[0].originalProtection, 'VIEWER_KEY_PHOTO');
+    assert.equal(body.files[0].processingStatus, 'COMPLETE');
+    const stored = fs.readFileSync(path.join(dataDir, body.files[0].originalArtifact));
+    assert.equal(stored.subarray(0,4).toString(), 'SQE2');
+    assert.ok(!stored.includes(Buffer.from('Synthetic evidence')));
     if (label === 'missing') {
-      const call = async (route, body, token) => {
-        const response = await fetch(base + route, { method: body === undefined ? 'GET' : 'POST', headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) }, ...(body !== undefined ? { body: JSON.stringify(body) } : {}) });
-        return { status: response.status, data: await response.json() };
+      const call = async (route, payload, token) => {
+        const res = await fetch(base + route, { method: payload === undefined ? 'GET' : 'POST', headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) }, ...(payload !== undefined ? { body: JSON.stringify(payload) } : {}) });
+        return { status: res.status, body: await res.json() };
       };
-      assert.equal((await call('/custody/invite', {})).status, 401);
-      const investigator = (await call('/auth/login', { username: 'investigator', password: 'test-investigator-password-2026' })).data.token;
-      assert.ok(investigator);
-      assert.equal((await call('/custody/invite', {}, investigator)).status, 401);
-      const admin = (await call('/auth/login', { username: 'admin', password: 'test-admin-password-2026' })).data.token;
-      const invitation = (await call('/custody/invite', {}, admin)).data;
-      const checked = (await call('/custody/check', { token: invitation.token })).data;
-      const { keys, releaseBody } = require('../test-support/court');
-      const crypto = require('node:crypto');
-      const registration = { token: invitation.token, publicKey: keys.publicKey.export({ type: 'spki', format: 'pem' }), proof: crypto.sign('sha256', Buffer.from(checked.challenge), { key: keys.privateKey, padding: crypto.constants.RSA_PKCS1_PSS_PADDING, saltLength: 32 }).toString('base64') };
-      assert.equal((await call('/custody/register', { ...registration, privateKey: 'must never accept this' })).status, 400);
-      assert.equal((await call('/custody/register', registration)).status, 200);
-      assert.equal((await call('/custody/register', registration)).status, 400);
-      assert.equal((await call('/custody/status', undefined, admin)).data.ready, true);
-      assert.equal((await call('/evidence-intake')).data.ready, true);
-      const submitted = await call('/report-base64', report);
-      assert.equal(submitted.status, 200);
-      const file = submitted.data.files[0];
-      assert.equal(file.originalProtection, 'COURT_SEALED');
-      assert.equal(file.processingStatus, 'COMPLETE');
-      const artifactBase = `/cases/${submitted.data.id}/evidence/`;
-      assert.equal((await call(artifactBase + file.originalArtifact, undefined, admin)).status, 403);
-      const adapter = async (method, route, body, token) => { const response = await call(route, method === 'GET' ? undefined : body, token); return { statusCode: response.status, body: response.data }; };
-      const grantBody = await releaseBody(adapter, artifactBase + file.name, admin, 'Testing enrolled custodian court release');
-      const grant = await call(artifactBase + file.name + '/original-access', grantBody, admin);
-      assert.equal(grant.status, 200);
-      const original = await fetch(base + artifactBase + file.originalArtifact, { headers: { Authorization: `Bearer ${admin}`, 'X-Original-Grant': grant.data.grant } });
+      const admin = (await call('/auth/login', { username: 'admin', password: 'test-admin-password-2026' })).body.token;
+      assert.equal((await call('/courts', { username: 'court-one', password: 'court-test-password-2026' })).status, 401);
+      assert.equal((await call('/courts', { username: 'court-one', password: 'court-test-password-2026', role: 'ADMIN' }, admin)).body.role, 'COURT');
+      const court = (await call('/auth/login', { username: 'court-one', password: 'court-test-password-2026' })).body.token;
+      assert.ok(court);
+      assert.equal((await call('/courts', { username: 'court-two', password: 'court-test-password-2026' }, court)).status, 401);
+      assert.equal((await call('/viewer-key', { password: 'incorrect' }, court)).status, 403);
+      const courtKey = (await call('/viewer-key', { password: 'court-test-password-2026' }, court)).body.key;
+      const adminKey = (await call('/viewer-key', { password: 'test-admin-password-2026' }, admin)).body.key;
+      assert.ok(courtKey && adminKey && courtKey !== adminKey);
+      assert.equal((await call('/viewer-key', { password: 'court-test-password-2026' }, court)).status, 409);
+      assert.equal((await call('/viewer-key', undefined, court)).body.configured, true);
+      const route = `/cases/${body.id}/evidence/${body.files[0].name}`;
+      assert.equal((await call(route + '?original=1', undefined, court)).status, 403);
+      let challenge = (await call(route + '/viewer-challenge', {}, court)).body.challenge;
+      const fields = { challenge, key: courtKey, reason: 'Review the original evidence for this test case.', orderReference: 'TEST-COURT-01' };
+      assert.equal((await call(route + '/original-access', { ...fields, key: adminKey }, court)).status, 403);
+      assert.equal((await call(route + '/original-access', fields, court)).status, 422);
+      assert.equal((await call(route + '/original-access', { ...fields, photo: require('../test-support/viewer').testPhoto() }, court)).status, 403);
+      challenge = (await call(route + '/viewer-challenge', {}, court)).body.challenge;
+      assert.equal((await call(route + '/original-access', { ...fields, challenge, photo: Buffer.from('not a photo').toString('base64') }, court)).status, 422);
+      challenge = (await call(route + '/viewer-challenge', {}, court)).body.challenge;
+      const access = await call(route + '/original-access', { ...fields, challenge, photo: require('../test-support/viewer').testPhoto() }, court);
+      assert.equal(access.status, 200, JSON.stringify(access.body));
+      const original = await fetch(base + route + '?original=1', { headers: { Authorization: `Bearer ${court}`, 'X-Original-Grant': access.body.grant } });
       assert.equal(original.status, 200);
       assert.equal(await original.text(), 'Synthetic evidence');
+      assert.equal((await fetch(base + route + '?original=1', { headers: { Authorization: `Bearer ${court}`, 'X-Original-Grant': access.body.grant } })).status, 403);
+      const audit = (await call('/audit', undefined, admin)).body;
+      const entry = audit.events.find(event => event.accessId === access.body.accessId && event.event === 'ORIGINAL_ACCESS_GRANTED');
+      assert.equal(entry.actor, 'court-one');
+      assert.equal(entry.role, 'COURT');
+      assert.ok(entry.viewerPhotoHash);
+      const encryptedPhoto = fs.readFileSync(path.join(dataDir, entry.viewerPhotoArtifact));
+      assert.equal(encryptedPhoto.subarray(0,4).toString(), 'SQE2');
+      const photoRoute = `/access-audits/${access.body.accessId}/photo`;
+      assert.equal((await call(photoRoute)).status, 401);
+      assert.equal((await call(photoRoute, undefined, court)).status, 401);
+      const photo = await fetch(base + photoRoute, { headers: { Authorization: `Bearer ${admin}` } });
+      assert.equal(photo.status, 200);
+      assert.equal(photo.headers.get('content-type'), 'image/png');
+      assert.ok(!JSON.stringify(audit).includes(courtKey));
+      assert.ok(!fs.readFileSync(path.join(dataDir, 'viewer-key-court-one.txt'), 'utf8').includes(courtKey));
     }
   });
 }

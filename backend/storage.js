@@ -25,6 +25,10 @@ function streamName(name) {
   if (!['audit', 'ledger'].includes(name)) throw new StorageError('Invalid log stream', 400);
   return name;
 }
+function authorityName(name) {
+  if (!/^[a-z][a-z0-9_-]{2,63}$/.test(String(name))) throw new StorageError('Invalid authority username', 400);
+  return name;
+}
 
 class LocalStorage {
   constructor(directory) { this.directory = directory; this.provider = 'local'; this.locks = new Map(); }
@@ -66,7 +70,22 @@ class LocalStorage {
     this.locks.set(stream, operation);
     try { await operation; } finally { if (this.locks.get(stream) === operation) this.locks.delete(stream); }
   }
-  async getAuthorities() { return null; } // local development retains environment-based accounts
+  async getAuthorities() {
+    const names = (await fs.promises.readdir(this.directory)).filter(name => /^authority-[a-z0-9_-]+\.json$/.test(name));
+    return Promise.all(names.map(name => fs.promises.readFile(path.join(this.directory, name), 'utf8').then(JSON.parse)));
+  }
+  async createCourtAccount(user) {
+    await fs.promises.writeFile(path.join(this.directory, `authority-${authorityName(user.username)}.json`), JSON.stringify(user), { flag: 'wx', mode: 0o600 });
+  }
+  async getViewerKey(username) {
+    try { return await fs.promises.readFile(path.join(this.directory, `viewer-key-${authorityName(username)}.txt`), 'utf8'); }
+    catch (error) { if (error.code === 'ENOENT') return null; throw error; }
+  }
+  async registerViewerKey(username, hash) {
+    try { await fs.promises.writeFile(path.join(this.directory, `viewer-key-${authorityName(username)}.txt`), hash, { flag: 'wx', mode: 0o600 }); }
+    catch (error) { if (error.code !== 'EEXIST') throw error; }
+    return this.getViewerKey(username);
+  }
   async getCustodianPublicKey() {
     try { return await fs.promises.readFile(path.join(this.directory, 'custodian-public.pem'), 'utf8'); }
     catch (error) { if (error.code === 'ENOENT') return null; throw error; }
@@ -171,6 +190,17 @@ class SupabaseStorage {
   async getAuthorities() {
     const rows = await this.request('/rest/v1/sentinelq_authorities?select=username,role,password_hash&enabled=eq.true&order=username');
     return rows.map(row => ({ username: row.username, role: row.role, passwordHash: row.password_hash }));
+  }
+  async createCourtAccount(user) {
+    await this.request('/rest/v1/sentinelq_authorities', { method: 'POST', body: { username: authorityName(user.username), role: 'COURT', password_hash: user.passwordHash } });
+  }
+  async getViewerKey(username) {
+    const rows = await this.request(`/rest/v1/sentinelq_config?id=eq.viewer_key_${authorityName(username)}&select=value`);
+    return rows[0]?.value || null;
+  }
+  async registerViewerKey(username, hash) {
+    await this.request('/rest/v1/sentinelq_config?on_conflict=id', { method: 'POST', headers: { Prefer: 'resolution=ignore-duplicates' }, body: { id: `viewer_key_${authorityName(username)}`, value: hash } });
+    return this.getViewerKey(username);
   }
   async getCustodianPublicKey() {
     const rows = await this.request('/rest/v1/sentinelq_config?id=eq.custodian_public_key&select=value');

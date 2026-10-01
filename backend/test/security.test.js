@@ -1,4 +1,4 @@
-const court = require('../test-support/court');
+const viewer = require('../test-support/viewer');
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { spawn } = require('node:child_process');
@@ -10,7 +10,7 @@ const TEST_ADMIN_PASSWORD = 'test-admin-password-2026';
 const TEST_JUDICIAL_KEY = 'test-judicial-access-key-2026-at-least-thirty-two-characters';
 
 function testEnvironment(port, dataDir) {
-  return { ...process.env, SENTINELQ_SKIP_ENV_FILE: '1', ...court.environment, SENTINELQ_STORAGE_PROVIDER: 'local', PORT: port, SENTINELQ_DATA_DIR: dataDir, SENTINELQ_RATE_LIMIT_MULTIPLIER: '10', SENTINELQ_SEED_DEMO: '0', SENTINELQ_STORAGE_KEY: 'test-storage-key-2026-at-least-thirty-two-characters', SENTINELQ_AUDIT_KEY: 'test-audit-key-2026-at-least-thirty-two-characters', SENTINELQ_ADMIN_PASSWORD: TEST_ADMIN_PASSWORD, SENTINELQ_JUDICIAL_ACCESS_KEY: TEST_JUDICIAL_KEY, SENTINELQ_INVESTIGATOR_PASSWORD: 'test-investigator-password-2026', SENTINELQ_AUDITOR_PASSWORD: 'test-auditor-password-2026', SENTINELQ_MANAGER_PASSWORD: 'test-manager-password-2026' };
+  return { ...process.env, SENTINELQ_SKIP_ENV_FILE: '1', SENTINELQ_COURT_PUBLIC_KEY: '', SENTINELQ_COURT_PUBLIC_KEY_PATH: '', SENTINELQ_STORAGE_PROVIDER: 'local', PORT: port, SENTINELQ_DATA_DIR: dataDir, SENTINELQ_RATE_LIMIT_MULTIPLIER: '10', SENTINELQ_SEED_DEMO: '0', SENTINELQ_STORAGE_KEY: 'test-storage-key-2026-at-least-thirty-two-characters', SENTINELQ_AUDIT_KEY: 'test-audit-key-2026-at-least-thirty-two-characters', SENTINELQ_ADMIN_PASSWORD: TEST_ADMIN_PASSWORD, SENTINELQ_JUDICIAL_ACCESS_KEY: TEST_JUDICIAL_KEY, SENTINELQ_INVESTIGATOR_PASSWORD: 'test-investigator-password-2026', SENTINELQ_AUDITOR_PASSWORD: 'test-auditor-password-2026', SENTINELQ_MANAGER_PASSWORD: 'test-manager-password-2026' };
 }
 
 function request(method, pathname, body, token, extraHeaders = {}) {
@@ -129,10 +129,10 @@ test('SentinelQ security and IDOR tests', async (t) => {
     assert.equal(auditorAccess.statusCode, 401);
     const auditorDetails = await request('POST', `/cases/${caseId}/judicial-details`, { key: TEST_JUDICIAL_KEY, reason: 'Judicial review of sensitive case information' }, auditorLogin.body.token);
     assert.equal(auditorDetails.statusCode, 401);
-    const release = await court.releaseBody(request, `/cases/${caseId}/evidence/${evidenceId}`, adminToken, 'Judicial review of this original evidence');
+    const release = await viewer.accessBody(request, `/cases/${caseId}/evidence/${evidenceId}`, adminToken, 'Judicial review of this original evidence');
     const secondLogin = await request('POST', '/auth/login', { username: 'admin', password: TEST_ADMIN_PASSWORD });
     assert.equal((await request('POST', `/cases/${caseId}/evidence/${evidenceId}/original-access`, release, secondLogin.body.token)).statusCode, 403);
-    assert.equal((await request('POST', `/cases/${caseId}/evidence/${evidenceId}/court-request`, {}, auditorLogin.body.token)).statusCode, 401);
+    assert.equal((await request('POST', `/cases/${caseId}/evidence/${evidenceId}/viewer-challenge`, {}, auditorLogin.body.token)).statusCode, 401);
     const attempts = await Promise.all([
       request('POST', `/cases/${caseId}/evidence/${evidenceId}/original-access`, release, adminToken),
       request('POST', `/cases/${caseId}/evidence/${evidenceId}/original-access`, release, adminToken)
@@ -145,7 +145,7 @@ test('SentinelQ security and IDOR tests', async (t) => {
     assert.equal(originalRes.statusCode, 200);
     assert.equal(originalRes.body, testFile.toString());
     const storedOriginal = fs.readFileSync(path.join(testDataDir, caseRes.body.files[0].originalArtifact));
-    assert.equal(storedOriginal.subarray(0, 4).toString(), 'SQC1');
+    assert.equal(storedOriginal.subarray(0, 4).toString(), 'SQE2');
     assert.ok(!storedOriginal.includes(testFile));
     const reused = await request('GET', originalPath, null, adminToken, { 'X-Original-Grant': access.body.grant });
     assert.equal(reused.statusCode, 403);
@@ -153,7 +153,7 @@ test('SentinelQ security and IDOR tests', async (t) => {
     assert.ok(audit.body.events.some(event => event.event === 'ORIGINAL_ACCESS_GRANTED' && event.caseId === caseId && event.reason === 'Judicial review of this original evidence'));
     assert.ok(audit.body.events.some(event => event.event === 'ORIGINAL_EVIDENCE_ACCESS' && event.caseId === caseId));
     assert.ok(audit.body.events.some(event => event.event === 'ORIGINAL_ACCESS_GRANTED' && event.orderReference === 'ORDER-TEST-2026'));
-    assert.ok(!JSON.stringify(audit.body).includes(release.release));
+    assert.ok(!JSON.stringify(audit.body).includes(release.key));
   });
 
   await t.test('Non-existent case returns 404', async () => {

@@ -106,7 +106,7 @@ export default function EvidenceCapture({ onAdd, onBusy, disabled, remainingByte
     {file && <div className="capture-review">
       <strong>Review your capture — original, not yet masked</strong>
       {url && (file.type.startsWith('image/') ? <img className="capture-preview" src={url} alt="Captured evidence preview" /> : file.type.startsWith('video/') ? <video className="capture-preview" src={url} controls playsInline /> : <audio src={url} controls />)}
-      <p>After submission, photos and video are blurred, and voices are altered. Spoken names remain audible. The original is encrypted for the independent custodian.</p>
+      <p>After submission, photos and video are blurred, and voices are altered. Spoken names remain audible. The original is encrypted in storage and restricted to authorized viewers with a personal key and recorded photo.</p>
       <div className="capture-actions"><button type="button" disabled={disabled} onClick={() => { if (onAdd([file])) discard(); }}>Use this evidence</button><button type="button" onClick={discard}>Discard</button></div>
     </div>}
   </div>;

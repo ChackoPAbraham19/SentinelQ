@@ -6,6 +6,10 @@ Render dashboard: https://dashboard.render.com/web/srv-daukri7pn0mc738359kg
 
 Workspace: Festin's workspace. Service: `srv-daukri7pn0mc738359kg`. Initial deployed commit: `ace483fde1a13cde7fa6d99ac672235d66856429`. Blueprint: `exs-daukprl9fdbs739bnvtg`.
 
+## Current original-access workflow — October 1, 2026
+
+The personal viewer-key and photo-audit release supersedes the independent-custodian setup requirement below. New evidence submissions require no key setup. Originals use platform storage encryption; admin/court viewing requires that account's personal key, a fresh camera photo, reference, and reason. Apply the court_viewer_role migration before deploying. See [current evidence flow](EVIDENCE_PRIVACY.md) for setup, verification, and security limits.
+
 ## Evidence privacy release — October 1, 2026
 
 Commit `01b9194466ed2222e44cc0c9103b76015ba31719` deployed successfully as `dep-dausdnh7lnhs739p0h90`. Public health and capabilities endpoints returned HTTP 200, and the live frontend displayed the independent-custodian access explanation. All 62 local tests and the frontend build passed before release.
@@ -47,7 +51,6 @@ SUPABASE_SECRET_KEY=<existing backend key>
 SENTINELQ_STORAGE_KEY=<existing storage key>
 SENTINELQ_AUDIT_KEY=<existing audit key>
 SENTINELQ_JUDICIAL_ACCESS_KEY=<existing judicial key>
-SENTINELQ_COURT_PUBLIC_KEY=<independent custodian public PEM; never the private key>
 ```
 
 The service uses Render's `RENDER_EXTERNAL_URL` as its allowed origin. Do not copy the localhost `ALLOWED_ORIGIN` or local `PORT` into Render. For a custom domain, set `ALLOWED_ORIGIN` to its exact HTTPS origin. The public Node port must remain behind Render's trusted HTTPS proxy. `/readyz` returns only a boolean for internal HTTP health probes; application endpoints require HTTPS.

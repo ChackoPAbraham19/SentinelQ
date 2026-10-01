@@ -5,6 +5,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const { issueRelease } = require('./court-vault');
+const { readRecoveryKey } = require('./custodian-backup');
 
 function main() {
   const [command, ...args] = process.argv.slice(2);
@@ -24,12 +25,12 @@ function main() {
   } else if (command === 'release' && args.length === 4) {
     const [privatePath, requestPath, orderReference, outputPath] = args;
     const request = JSON.parse(fs.readFileSync(requestPath, 'utf8'));
-    const key = crypto.createPrivateKey({ key: fs.readFileSync(privatePath), passphrase });
+    const key = readRecoveryKey(fs.readFileSync(privatePath), passphrase);
     const release = issueRelease(request, key, orderReference);
     fs.writeFileSync(outputPath, release, { flag: 'wx', mode: 0o600 });
     console.log('Release saved; valid for at most five minutes and only for the requesting admin session and evidence. Transfer it securely.');
   } else {
-    throw new Error('Usage: node court-custodian.js init <directory> | release <private.pem> <request.json> <court-order-reference> <release.txt>');
+    throw new Error('Usage: node court-custodian.js init <directory> | release <private.pem-or-recovery.json> <request.json> <court-order-reference> <release.txt>');
   }
 }
 try { main(); } catch (error) { console.error(error.message); process.exitCode = 1; }

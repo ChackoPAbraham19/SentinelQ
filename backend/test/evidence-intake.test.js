@@ -48,11 +48,46 @@ for (const [label, publicKey] of [['missing', ''], ['invalid', 'invalid-public-k
     const error = await blocked.json();
     assert.equal(error.code, status.code);
     assert.equal(error.error, status.message);
-    assert.match(error.error, /independent custodian public key/);
+    assert.match(error.error, /No key is needed from you/);
     assert.doesNotMatch(error.error, /rejected by security validation/);
     assert.deepEqual(fs.readdirSync(dataDir).sort(), before);
     const accepted = await fetch(`${base}/report-base64`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...report, files: [] }) });
     assert.equal(accepted.status, 200);
     assert.equal((await accepted.json()).ok, true);
+    if (label === 'missing') {
+      const call = async (route, body, token) => {
+        const response = await fetch(base + route, { method: body === undefined ? 'GET' : 'POST', headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) }, ...(body !== undefined ? { body: JSON.stringify(body) } : {}) });
+        return { status: response.status, data: await response.json() };
+      };
+      assert.equal((await call('/custody/invite', {})).status, 401);
+      const investigator = (await call('/auth/login', { username: 'investigator', password: 'test-investigator-password-2026' })).data.token;
+      assert.ok(investigator);
+      assert.equal((await call('/custody/invite', {}, investigator)).status, 401);
+      const admin = (await call('/auth/login', { username: 'admin', password: 'test-admin-password-2026' })).data.token;
+      const invitation = (await call('/custody/invite', {}, admin)).data;
+      const checked = (await call('/custody/check', { token: invitation.token })).data;
+      const { keys, releaseBody } = require('../test-support/court');
+      const crypto = require('node:crypto');
+      const registration = { token: invitation.token, publicKey: keys.publicKey.export({ type: 'spki', format: 'pem' }), proof: crypto.sign('sha256', Buffer.from(checked.challenge), { key: keys.privateKey, padding: crypto.constants.RSA_PKCS1_PSS_PADDING, saltLength: 32 }).toString('base64') };
+      assert.equal((await call('/custody/register', { ...registration, privateKey: 'must never accept this' })).status, 400);
+      assert.equal((await call('/custody/register', registration)).status, 200);
+      assert.equal((await call('/custody/register', registration)).status, 400);
+      assert.equal((await call('/custody/status', undefined, admin)).data.ready, true);
+      assert.equal((await call('/evidence-intake')).data.ready, true);
+      const submitted = await call('/report-base64', report);
+      assert.equal(submitted.status, 200);
+      const file = submitted.data.files[0];
+      assert.equal(file.originalProtection, 'COURT_SEALED');
+      assert.equal(file.processingStatus, 'COMPLETE');
+      const artifactBase = `/cases/${submitted.data.id}/evidence/`;
+      assert.equal((await call(artifactBase + file.originalArtifact, undefined, admin)).status, 403);
+      const adapter = async (method, route, body, token) => { const response = await call(route, method === 'GET' ? undefined : body, token); return { statusCode: response.status, body: response.data }; };
+      const grantBody = await releaseBody(adapter, artifactBase + file.name, admin, 'Testing enrolled custodian court release');
+      const grant = await call(artifactBase + file.name + '/original-access', grantBody, admin);
+      assert.equal(grant.status, 200);
+      const original = await fetch(base + artifactBase + file.originalArtifact, { headers: { Authorization: `Bearer ${admin}`, 'X-Original-Grant': grant.data.grant } });
+      assert.equal(original.status, 200);
+      assert.equal(await original.text(), 'Synthetic evidence');
+    }
   });
 }

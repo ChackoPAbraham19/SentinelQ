@@ -67,6 +67,15 @@ class LocalStorage {
     try { await operation; } finally { if (this.locks.get(stream) === operation) this.locks.delete(stream); }
   }
   async getAuthorities() { return null; } // local development retains environment-based accounts
+  async getCustodianPublicKey() {
+    try { return await fs.promises.readFile(path.join(this.directory, 'custodian-public.pem'), 'utf8'); }
+    catch (error) { if (error.code === 'ENOENT') return null; throw error; }
+  }
+  async registerCustodianPublicKey(pem) {
+    try { await fs.promises.writeFile(path.join(this.directory, 'custodian-public.pem'), pem, { flag: 'wx', mode: 0o600 }); }
+    catch (error) { if (error.code !== 'EEXIST') throw error; }
+    return this.getCustodianPublicKey();
+  }
   async bootstrapAuthorities(users) { return users; }
   async checkKeys() {} // local ciphertext authenticates keys on read, as before
 }
@@ -162,6 +171,14 @@ class SupabaseStorage {
   async getAuthorities() {
     const rows = await this.request('/rest/v1/sentinelq_authorities?select=username,role,password_hash&enabled=eq.true&order=username');
     return rows.map(row => ({ username: row.username, role: row.role, passwordHash: row.password_hash }));
+  }
+  async getCustodianPublicKey() {
+    const rows = await this.request('/rest/v1/sentinelq_config?id=eq.custodian_public_key&select=value');
+    return rows[0]?.value || null;
+  }
+  async registerCustodianPublicKey(pem) {
+    await this.request('/rest/v1/sentinelq_config?on_conflict=id', { method: 'POST', headers: { Prefer: 'resolution=ignore-duplicates' }, body: { id: 'custodian_public_key', value: pem } });
+    return this.getCustodianPublicKey();
   }
   async bootstrapAuthorities(users) {
     await this.request('/rest/v1/sentinelq_authorities?on_conflict=username', { method: 'POST',

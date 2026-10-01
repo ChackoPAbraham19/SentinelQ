@@ -229,3 +229,10 @@ a { color: var(--sq-primary-strong); text-underline-offset: 4px; }
 .capture-review audio { display: block; width: 100%; margin: 14px 0; }
 .capture-recording { color: #9b271c; font-weight: 700; }
 @media (max-width: 600px) { .evidence-capture { padding: 14px; } .capture-actions button { flex: 1 1 120px; } }
+/* Custody is configured separately from the reporter workspace. */
+.custody-setup { max-width: 760px; margin: 32px auto; padding: 28px; }
+.custody-panel { margin-bottom: 24px; padding: 24px; }
+.custody-panel input, .custody-setup input:not([type="checkbox"]) { display: block; width: 100%; margin: 8px 0 18px; }
+.custody-panel button, .custody-setup button { margin: 8px 12px 12px 0; min-height: 44px; }
+.custody-setup label { display: block; margin-top: 16px; }
+.custody-fingerprint { display: block; overflow-wrap: anywhere; }

@@ -7,6 +7,7 @@ const { execFile } = require('child_process');
 const { createStorage, StorageError } = require('./storage');
 const { createFrontend } = require('./frontend');
 const courtVault = require('./court-vault');
+const { CustodySetup } = require('./custody-setup');
 
 if (process.env.SENTINELQ_SKIP_ENV_FILE !== '1') {
   loadEnvFile(path.join(__dirname, '.env'));
@@ -15,10 +16,11 @@ if (process.env.SENTINELQ_SKIP_ENV_FILE !== '1') {
 
 const DATA_DIR = path.resolve(process.env.SENTINELQ_DATA_DIR || path.join(__dirname, 'data'));
 const vault = createStorage(process.env, DATA_DIR);
+const custodySetup = new CustodySetup(vault);
 
 const MAX_REQUEST_BYTES = 12 * 1024 * 1024;
 const MAX_FILE_BYTES = 8 * 1024 * 1024;
-const EVIDENCE_INTAKE_UNAVAILABLE = 'Evidence uploads are temporarily unavailable because secure original storage has not been configured. The platform operator must configure the independent custodian public key. You can submit a report without attachments.';
+const EVIDENCE_INTAKE_UNAVAILABLE = 'Evidence uploads are temporarily unavailable. Please try again later or submit a report without attachments. No key is needed from you.';
 const PRIVACY_DERIVATIVE_VERSION = 3;
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || process.env.RENDER_EXTERNAL_URL || 'http://localhost:3000';
 const serveFrontend = process.env.SENTINELQ_SERVE_FRONTEND === '1' ? createFrontend(path.join(__dirname, '..', 'frontend', 'dist')) : null;
@@ -36,7 +38,7 @@ const courtRequests = new Map();
 const rateBuckets = new Map();
 let lastRatePruneAt = 0;
 const ROLE_PERMISSIONS = Object.freeze({
-  ADMIN: ['cases:read', 'cases:write', 'chat:read', 'chat:write', 'evidence:read', 'evidence:original', 'evidence:verify', 'audit:read', 'notes:read', 'notes:write', 'assign:write'],
+  ADMIN: ['custody:setup', 'cases:read', 'cases:write', 'chat:read', 'chat:write', 'evidence:read', 'evidence:original', 'evidence:verify', 'audit:read', 'notes:read', 'notes:write', 'assign:write'],
   CASE_MANAGER: ['cases:read', 'cases:write', 'chat:read', 'chat:write', 'evidence:read', 'evidence:verify', 'notes:read', 'notes:write', 'assign:write'],
   INVESTIGATOR: ['cases:read', 'chat:read', 'chat:write', 'evidence:read', 'evidence:verify', 'notes:read', 'notes:write'],
   AUDITOR: ['cases:read', 'evidence:read', 'evidence:verify', 'audit:read']
@@ -518,11 +520,46 @@ async function handleRequest(req, res) {
 
   if (req.method === 'GET' && pathname === '/evidence-intake') {
     try {
-      courtVault.publicKeyFromEnvironment();
+      await custodySetup.requirePublicKey();
       return sendJson(res, { ok: true, ready: true });
     } catch {
       return sendJson(res, { ok: true, ready: false, code: 'EVIDENCE_INTAKE_UNAVAILABLE', message: EVIDENCE_INTAKE_UNAVAILABLE });
     }
+  }
+
+  if (req.method === 'GET' && pathname === '/custody/status') {
+    if (!requirePermission(req, res, 'custody:setup')) return;
+    try {
+      const key = await custodySetup.publicKey();
+      return sendJson(res, { ok: true, ready: !!key, keyId: key ? courtVault.keyId(key) : null });
+    } catch { return sendJson(res, { ok: false, error: 'Custody configuration could not be read. Check the configured key and secure storage.' }, 503); }
+  }
+
+  if (req.method === 'POST' && pathname === '/custody/invite') {
+    const session = requirePermission(req, res, 'custody:setup');
+    if (!session) return;
+    try {
+      await auditEvent('CUSTODY_SETUP_INVITED', session);
+      const invite = await custodySetup.createInvite(session.username, ALLOWED_ORIGIN);
+      return sendJson(res, { ok: true, ...invite });
+    } catch { return sendJson(res, { ok: false, error: 'Setup cannot start. Custody may already be configured, or storage is unavailable.' }, 409); }
+  }
+
+  if (req.method === 'POST' && ['/custody/check', '/custody/register'].includes(pathname)) {
+    readJson(req, async (obj, error) => {
+      if (error) return sendJson(res, { ok: false, error: 'Invalid setup request' }, 400);
+      try {
+        if (pathname === '/custody/check') {
+          const invite = custodySetup.check(obj.token);
+          return sendJson(res, { ok: true, challenge: invite.challenge, expiresAt: invite.expiresAt });
+        }
+        if (Object.keys(obj).some(key => !['token', 'publicKey', 'proof'].includes(key))) throw new Error('Invalid enrollment fields');
+        const registration = await custodySetup.register(obj.token, obj.publicKey, obj.proof);
+        await auditEvent('CUSTODY_SETUP_COMPLETED', { username: registration.actor, role: 'ADMIN' }, null, { keyId: registration.keyId });
+        return sendJson(res, { ok: true, keyId: registration.keyId });
+      } catch { return sendJson(res, { ok: false, error: 'Setup could not be completed. Check the invitation and recovery file; custody may already be configured. Ask the administrator to check setup status before retrying.' }, 400); }
+    }, 12 * 1024);
+    return;
   }
 
   if (req.method === 'GET' && pathname === '/capabilities') {
@@ -649,7 +686,7 @@ async function handleRequest(req, res) {
         if (Number(deadManDays) > 0) return sendJson(res, { ok: false, error: 'dead-man release is not implemented and cannot be enabled' }, 400);
         let courtPublicKey;
         if (files.length) {
-          try { courtPublicKey = courtVault.publicKeyFromEnvironment(); }
+          try { courtPublicKey = await custodySetup.requirePublicKey(); }
           catch {
             return sendJson(res, { ok: false, code: 'EVIDENCE_INTAKE_UNAVAILABLE', error: EVIDENCE_INTAKE_UNAVAILABLE }, 503);
           }
@@ -1111,7 +1148,7 @@ async function handleRequest(req, res) {
     try {
       pruneOriginalGrants();
       if (courtRequests.size >= 5000) return sendJson(res, { ok: false, error: 'court request capacity reached' }, 503);
-      const publicKey = courtVault.publicKeyFromEnvironment();
+      const publicKey = await custodySetup.requirePublicKey();
       const stored = await vault.readArtifact(file.originalArtifact);
       if (!stored) throw new Error('missing original');
       const context = `evidence:${id}:${file.originalArtifact}`;
@@ -1143,7 +1180,7 @@ async function handleRequest(req, res) {
       const entry = typeof obj.requestId === 'string' ? courtRequests.get(obj.requestId) : null;
       try {
         if (reason.length < 20 || reason.length > 500 || !entry || entry.session !== session || entry.request.caseId !== id || entry.request.artifact !== file.originalArtifact) throw new Error('invalid request');
-        release = courtVault.verifyRelease(obj.release, entry.request, courtVault.publicKeyFromEnvironment());
+        release = courtVault.verifyRelease(obj.release, entry.request, await custodySetup.requirePublicKey());
       } catch (error) {
         await auditEvent('ORIGINAL_ACCESS_DENIED', session, id, { evidenceId });
         return sendJson(res, { ok: false, error: 'A valid court-signed release for this session and evidence, plus a reason of 20–500 characters, is required' }, 403);

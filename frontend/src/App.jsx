@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import axios from "axios";
+import { CustodyAdmin } from './CustodianSetup';
 import EvidenceCapture from "./EvidenceCapture";
 import { evidenceError as validateEvidence, MAX_EVIDENCE_BYTES } from "./capture.mjs";
 
@@ -1261,6 +1262,7 @@ export default function App() {
                       Refresh data
                     </button>
                   </div>
+                  {authority.user.role === 'ADMIN' && <CustodyAdmin api={API} token={authority.token} />}
                   <div className="metric-strip">
                     {metrics.map((metric) => (
                       <div className="metric" key={metric.label}>

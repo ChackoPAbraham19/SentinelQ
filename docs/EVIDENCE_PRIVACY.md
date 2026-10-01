@@ -16,9 +16,24 @@ Voice alteration is **not guaranteed speaker anonymization**. Names, addresses, 
 
 ## Custodian setup
 
+Reporters never supply a public or private key. Public encryption configuration is installed once, before the platform accepts evidence. The custodian's private key is used only to authorize later court releases. There is no court approval during normal submission.
+
+### Browser enrollment (no manual PEM configuration)
+
+1. An admin signs in and opens **Evidence protection setup → Create custodian invitation**. Share the invitation privately with the designated custodian. Do not complete independent custody enrollment on the administrator's device.
+2. The custodian opens the link on their own secured device, chooses a unique passphrase of at least 20 characters, and creates the recovery file locally.
+3. They save `sentinelq-custodian-recovery.json`, maintain protected backups, and select the saved file for a local verification check before activation. Only the public key and a proof-of-possession signature are transmitted; neither the backup nor passphrase is uploaded.
+4. The server registers the public key once in its private configuration store. The admin refreshes setup status and independently compares the displayed public-key fingerprint with the custodian. Uploads then work without changing Render environment variables or restarting the service.
+
+Invitations use random 256-bit tokens, expire after 30 minutes, are replaced by later invitations, and cannot be reused. The token is in a URL fragment to avoid request-path logs. Server restart invalidates outstanding invitations. Registration requires a signature bound to the invitation and origin. Existing custody keys cannot be overwritten through enrollment. An admin entrusted with initial setup can invite themselves; the organization must independently designate and verify its real custodian. Browser enrollment trusts the delivered application code and the custodian's device. This is not protection against a malicious application host.
+
+The recovery file contains PKCS#8 private-key bytes encrypted using AES-256-GCM, a random 16-byte salt and 12-byte nonce, and PBKDF2-SHA256 with 600,000 iterations. It is protected by the custodian's passphrase, not the platform storage key. The offline release CLI accepts this JSON file in place of the encrypted PEM. Keep it and the passphrase outside platform administrator control; self-custody on the admin's device is suitable only for a demo and does not establish independent custody.
+
+### Offline enrollment alternative
+
 An independent court-designated custodian must perform this on their own secured machine, outside the platform administrator's control:
 
-1. Copy `backend/court-custodian.js` and `backend/court-vault.js` to that machine. Node.js is required.
+1. Copy `backend/court-custodian.js`, `backend/court-vault.js`, and `backend/custodian-backup.js` to that machine. Node.js is required.
 2. Set `SENTINELQ_CUSTODIAN_PASSPHRASE` through a secure local secret mechanism to a unique passphrase of at least 20 characters. Do not put it in source control or shell history.
 3. Run `node court-custodian.js init <secure-directory>`.
 4. Retain `court-private.pem` and its passphrase independently, with protected backups. Configure restrictive Windows ACLs or equivalent OS permissions on that directory; Unix mode flags alone do not establish Windows ACLs.
@@ -37,6 +52,8 @@ Never generate the real custodian private key on the application host, paste it 
    ```text
    node court-custodian.js release <court-private.pem> <request.json> <court-order-reference> <release.txt>
    ```
+
+   For browser enrollment, replace `<court-private.pem>` with the saved `sentinelq-custodian-recovery.json` path. Use the passphrase chosen during enrollment through the same secure local secret mechanism.
 
 4. Transfer the release securely. The admin pastes it into **Signed court release**, records a reason, and selects **Unlock once and download**, or **Authorize and create masked copy** for failed/older derivatives.
 5. The server validates the custodian signature, case/file/session binding, expiry, and reason, then consumes the request. A one-use grant expires within 60 seconds. Release tokens expire within five minutes. Concurrent redemption and replay fail. Restart/logout invalidates outstanding requests; logout also clears outstanding grants.

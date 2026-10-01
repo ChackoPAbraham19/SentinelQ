@@ -1,5 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import axios from "axios";
+import EvidenceCapture from "./EvidenceCapture";
+import { evidenceError as validateEvidence, MAX_EVIDENCE_BYTES } from "./capture.mjs";
 
 const API =
   window.SENTINELQ_CONFIG?.apiBaseUrl ||
@@ -405,6 +407,8 @@ export default function App() {
   const [description, setDescription] = useState("");
   const [anonymizedDescription, setAnonymizedDescription] = useState("");
   const [files, setFiles] = useState([]);
+  const [captureBusy, setCaptureBusy] = useState(false);
+  const [attachmentError, setAttachmentError] = useState("");
   const [result, setResult] = useState(null);
   const [activeView, setActiveView] = useState("welcome");
   const workspaceRef = useRef(null);
@@ -482,9 +486,20 @@ export default function App() {
     }
   };
 
+  const addEvidence = incoming => {
+    const combined = [...files, ...incoming];
+    const error = validateEvidence(combined);
+    setAttachmentError(error);
+    if (error) return false;
+    setFiles(combined);
+    return true;
+  };
+
   const submit = async (e) => {
     e.preventDefault();
-    if (submitting) return;
+    if (submitting || captureBusy) return;
+    const error = validateEvidence(files);
+    if (error) { setAttachmentError(error); return; }
     setSubmitting(true);
     try {
       const toSend = {
@@ -1095,19 +1110,22 @@ export default function App() {
                     <span className="mono">OPTIONAL</span>
                   </div>
                   <h2 className="panel-title">Add supporting evidence.</h2>
+                  <EvidenceCapture onAdd={addEvidence} onBusy={setCaptureBusy} disabled={submitting || files.length >= 5} remainingBytes={MAX_EVIDENCE_BYTES - files.reduce((sum, file) => sum + file.size, 0)} />
                   <label className="drop-zone">
                     <span className="drop-icon"><NavIcon name="upload" /></span>
                     <strong>Browse evidence files <span aria-hidden="true">↗</span></strong>
                     <small>
-                      JPEG / PNG / TXT / VIDEO / AUDIO · PDF QUARANTINED · 8 MB MAX
+                      JPEG / PNG / TXT / VIDEO / AUDIO · PDF QUARANTINED · FIVE FILES / 8 MiB TOTAL
                     </small>
                     <input
                       type="file"
-                      accept="image/jpeg,image/png,video/mp4,video/webm,audio/wav,audio/mpeg,audio/mp4,audio/ogg,.pdf,.txt"
+                      accept="image/jpeg,image/png,video/mp4,video/webm,audio/webm,audio/wav,audio/mpeg,audio/mp4,audio/ogg,.weba,.pdf,.txt"
                       multiple
-                      onChange={(e) => { setFiles(Array.from(e.target.files)); e.target.value = ""; }}
+                      disabled={submitting || captureBusy}
+                      onChange={(e) => { addEvidence(Array.from(e.target.files)); e.target.value = ""; }}
                     />
                   </label>
+                  {attachmentError && <p className="inline-warning" role="alert">{attachmentError}</p>}
                   {files.length > 0 && (
                     <div className="file-pipeline">
                       {Array.from(files).map((file, index) => (
@@ -1119,7 +1137,7 @@ export default function App() {
                               {Math.round(file.size / 1024)} KB
                             </small>
                           </div>
-                          <button type="button" className="text-action" aria-label={`Remove ${file.name}`} onClick={() => setFiles(current => Array.from(current).filter((_, fileIndex) => fileIndex !== index))}>Remove</button>
+                          <button type="button" className="text-action" disabled={submitting} aria-label={`Remove ${file.name}`} onClick={() => { setFiles(current => Array.from(current).filter((_, fileIndex) => fileIndex !== index)); setAttachmentError(""); }}>Remove</button>
                         </div>
                       ))}
                       {Array.from(files)
@@ -1139,7 +1157,7 @@ export default function App() {
                         ))}
                     </div>
                   )}
-                  <div id="report-submit" tabIndex={-1} className="submission-actions"><p>Ready to send your report?<small>Review your details above before submitting.</small></p><button className="primary-action" type="submit" form="incident-report" disabled={submitting}>{submitting ? "Submitting..." : "Submit report"}<span aria-hidden="true">→</span></button></div>
+                  <div id="report-submit" tabIndex={-1} className="submission-actions"><p>Ready to send your report?<small>{captureBusy ? "Use or discard your capture before submitting." : "Review your details above before submitting."}</small></p><button className="primary-action" type="submit" form="incident-report" disabled={submitting || captureBusy}>{submitting ? "Submitting..." : "Submit report"}<span aria-hidden="true">→</span></button></div>
                   <p className="form-footnote"><NavIcon name="shield" />Save the recovery key shown after submission. You will need it to return to your case; it cannot be reset.</p>
                 </section>
                 {result && (

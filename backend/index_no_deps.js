@@ -1361,7 +1361,7 @@ function computeHash(buf){
 
 function mimeForName(name){
   const extension = path.extname(String(name)).toLowerCase();
-  return ({ '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png', '.pdf': 'application/pdf', '.mp4': 'video/mp4', '.webm': 'video/webm', '.wav': 'audio/wav', '.mp3': 'audio/mpeg', '.m4a': 'audio/mp4', '.ogg': 'audio/ogg', '.txt': 'text/plain' })[extension] || null;
+  return ({ '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png', '.pdf': 'application/pdf', '.mp4': 'video/mp4', '.webm': 'video/webm', '.weba': 'audio/webm', '.wav': 'audio/wav', '.mp3': 'audio/mpeg', '.m4a': 'audio/mp4', '.ogg': 'audio/ogg', '.txt': 'text/plain' })[extension] || null;
 }
 
 function inspectUpload(name, buf){
@@ -1371,7 +1371,7 @@ function inspectUpload(name, buf){
   if (ext === '.png' && buf.subarray(0,8).toString('hex') !== '89504e470d0a1a0a') return { ok: false, error: 'png signature mismatch' };
   if (ext === '.pdf' && buf.subarray(0,5).toString() !== '%PDF-') return { ok: false, error: 'pdf signature mismatch' };
   if (ext === '.mp4' && buf.subarray(4,8).toString() !== 'ftyp') return { ok: false, error: 'mp4 signature mismatch' };
-  if (ext === '.webm' && buf.subarray(0,4).toString('hex') !== '1a45dfa3') return { ok: false, error: 'webm signature mismatch' };
+  if (['.webm', '.weba'].includes(ext) && buf.subarray(0,4).toString('hex') !== '1a45dfa3') return { ok: false, error: 'webm signature mismatch' };
   if (ext === '.wav' && !(buf.subarray(0,4).toString() === 'RIFF' && buf.subarray(8,12).toString() === 'WAVE')) return { ok: false, error: 'wav signature mismatch' };
   if (ext === '.mp3' && !(buf.subarray(0,3).toString() === 'ID3' || (buf[0] === 0xff && (buf[1] & 0xe0) === 0xe0))) return { ok: false, error: 'mp3 signature mismatch' };
   if (ext === '.m4a' && buf.subarray(4,8).toString() !== 'ftyp') return { ok: false, error: 'm4a signature mismatch' };

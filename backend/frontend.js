@@ -8,7 +8,7 @@ function createFrontend(root) {
   const headers = {
     'Content-Security-Policy': "default-src 'self'; connect-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; style-src 'self'; script-src 'self'; font-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
     'X-Content-Type-Options': 'nosniff', 'X-Frame-Options': 'DENY',
-    'Referrer-Policy': 'no-referrer', 'Permissions-Policy': 'camera=(), microphone=(), geolocation=()',
+    'Referrer-Policy': 'no-referrer', 'Permissions-Policy': 'camera=(self), microphone=(self), geolocation=()',
     'Cache-Control': 'no-cache',
   };
   return async function serve(req, res, pathname) {

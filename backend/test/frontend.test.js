@@ -27,6 +27,8 @@ test('production assets use the same origin and cannot expose server files', asy
   assert.equal(page.status, 200);
   assert.match(page.headers.get('content-security-policy'), /connect-src 'self'/);
   assert.equal(page.headers.get('x-content-type-options'), 'nosniff');
+  assert.equal(page.headers.get('permissions-policy'), 'camera=(self), microphone=(self), geolocation=()');
+  assert.match(page.headers.get('content-security-policy'), /media-src 'self' blob:/);
   assert.match(await page.text(), /reporting portal/);
   const config = await fetch(base + '/runtime-config.js');
   assert.equal(config.headers.get('cache-control'), 'no-store');

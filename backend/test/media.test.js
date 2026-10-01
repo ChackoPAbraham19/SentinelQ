@@ -187,7 +187,8 @@ test('media derivatives mask images, video, text and speech while keeping encryp
     ['sample.webm', videoPath, ['-c:v', 'libvpx', '-c:a', 'libvorbis'], 'video/mp4'],
     ['sample.mp3', audioPath, ['-c:a', 'libmp3lame'], 'audio/wav'],
     ['sample.m4a', audioPath, ['-c:a', 'aac'], 'audio/wav'],
-    ['sample.ogg', audioPath, ['-c:a', 'libvorbis'], 'audio/wav']
+    ['sample.ogg', audioPath, ['-c:a', 'libvorbis'], 'audio/wav'],
+    ['capture.weba', audioPath, ['-c:a', 'libopus', '-f', 'webm'], 'audio/wav']
   ];
   for (const [name, source, codec] of additionalMedia) {
     const converted = spawnSync(ffmpeg, ['-y', '-v', 'error', '-i', source, ...codec, path.join(directory, name)], { windowsHide: true });
@@ -206,4 +207,15 @@ test('media derivatives mask images, video, text and speech while keeping encryp
     assert.equal(copy.status, 200);
     assert.notDeepEqual(copy.body, fs.readFileSync(path.join(directory, additionalMedia[index][0])));
   }
+  const capturedAudio = formatView.body.case.files[4];
+  assert.equal(capturedAudio.mime, 'audio/webm');
+  assert.equal(capturedAudio.originalProtection, 'COURT_SEALED');
+  assert.ok(capturedAudio.transformations.includes('VOICE_ALTERED'));
+  const capturedRoute = `/cases/${formats.body.id}/evidence/${capturedAudio.name}`;
+  assert.equal((await request('GET', `${capturedRoute}?original=1`, null, token)).status, 403);
+  const capturedGrant = await request('POST', `${capturedRoute}/original-access`, await court.releaseBody(request, capturedRoute, token), token);
+  assert.equal(capturedGrant.status, 200);
+  const capturedOriginal = await request('GET', `${capturedRoute}?original=1`, null, token, { 'X-Original-Grant': capturedGrant.body.grant });
+  assert.equal(capturedOriginal.status, 200);
+  assert.deepEqual(capturedOriginal.body, fs.readFileSync(path.join(directory, 'capture.weba')));
 });

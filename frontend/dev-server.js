@@ -22,11 +22,11 @@ build.on('exit', code => {
     res.writeHead(200, {
       'Content-Type': type,
       'Cache-Control': extension === '.html' ? 'no-store' : 'no-cache',
-      'Content-Security-Policy': "default-src 'self'; connect-src http://127.0.0.1:4000 http://localhost:4000; img-src 'self' data:; style-src 'self'; script-src 'self'; base-uri 'none'; frame-ancestors 'none'",
+      'Content-Security-Policy': "default-src 'self'; connect-src http://127.0.0.1:4000 http://localhost:4000; img-src 'self' data: blob:; media-src 'self' blob:; style-src 'self'; script-src 'self'; base-uri 'none'; frame-ancestors 'none'",
       'Referrer-Policy': 'no-referrer',
       'X-Content-Type-Options': 'nosniff',
       'X-Frame-Options': 'DENY',
-      'Permissions-Policy': 'camera=(), microphone=(), geolocation=()'
+      'Permissions-Policy': 'camera=(self), microphone=(self), geolocation=()'
     });
     fs.createReadStream(selected).pipe(res);
   }).listen(3000, '127.0.0.1', () => console.log('SentinelQ frontend: http://localhost:3000'));

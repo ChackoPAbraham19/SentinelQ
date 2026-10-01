@@ -18,6 +18,7 @@ const vault = createStorage(process.env, DATA_DIR);
 
 const MAX_REQUEST_BYTES = 12 * 1024 * 1024;
 const MAX_FILE_BYTES = 8 * 1024 * 1024;
+const EVIDENCE_INTAKE_UNAVAILABLE = 'Evidence uploads are temporarily unavailable because secure original storage has not been configured. The platform operator must configure the independent custodian public key. You can submit a report without attachments.';
 const PRIVACY_DERIVATIVE_VERSION = 3;
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || process.env.RENDER_EXTERNAL_URL || 'http://localhost:3000';
 const serveFrontend = process.env.SENTINELQ_SERVE_FRONTEND === '1' ? createFrontend(path.join(__dirname, '..', 'frontend', 'dist')) : null;
@@ -515,6 +516,15 @@ async function handleRequest(req, res) {
     });
   }
 
+  if (req.method === 'GET' && pathname === '/evidence-intake') {
+    try {
+      courtVault.publicKeyFromEnvironment();
+      return sendJson(res, { ok: true, ready: true });
+    } catch {
+      return sendJson(res, { ok: true, ready: false, code: 'EVIDENCE_INTAKE_UNAVAILABLE', message: EVIDENCE_INTAKE_UNAVAILABLE });
+    }
+  }
+
   if (req.method === 'GET' && pathname === '/capabilities') {
     return sendJson(res, {
       ok: true,
@@ -637,6 +647,13 @@ async function handleRequest(req, res) {
         const { title = '', description = '', anonymizedDescription = '', files = [], regionBucket = '', deadManDays = 0, involved = '', incidentDate = '' } = obj;
         if (!String(title).trim() || !String(description).trim() || !Array.isArray(files) || files.length > 5 || String(title).length > 200 || String(description).length > 10000 || String(anonymizedDescription).length > 10000) return sendJson(res, { ok: false, error: 'invalid report fields' }, 400);
         if (Number(deadManDays) > 0) return sendJson(res, { ok: false, error: 'dead-man release is not implemented and cannot be enabled' }, 400);
+        let courtPublicKey;
+        if (files.length) {
+          try { courtPublicKey = courtVault.publicKeyFromEnvironment(); }
+          catch {
+            return sendJson(res, { ok: false, code: 'EVIDENCE_INTAKE_UNAVAILABLE', error: EVIDENCE_INTAKE_UNAVAILABLE }, 503);
+          }
+        }
         const safeDescription = (anonymizedDescription || description || '').trim() || description;
         const id = generateCaseId();
         const reporterId = generateReporterId();
@@ -672,9 +689,6 @@ async function handleRequest(req, res) {
           const safeName = `${id}-${crypto.randomUUID()}`;
           const originalName = `${safeName}.original`;
           const sanitizedName = `${safeName}.sanitized`;
-          let courtPublicKey;
-          try { courtPublicKey = courtVault.publicKeyFromEnvironment(); }
-          catch (error) { const failure = new Error('Evidence intake requires an independent court custodian public key. Contact the platform operator.'); failure.status = 503; throw failure; }
           await vault.writeArtifact(originalName, courtVault.sealOriginal(buf, `evidence:${id}:${originalName}`, courtPublicKey));
           createdArtifactPaths.push(originalName);
           let privacyResult = null;

@@ -74,6 +74,9 @@ test('anonymization and chat endpoints work', async (t) => {
   };
 
   await waitForServer();
+  const intake = await request('GET', '/evidence-intake');
+  assert.equal(intake.statusCode, 200);
+  assert.deepEqual(intake.body, { ok: true, ready: true });
 
   const login = await request('POST', '/auth/login', { username: 'admin', password: TEST_ADMIN_PASSWORD });
   assert.equal(login.statusCode, 200);

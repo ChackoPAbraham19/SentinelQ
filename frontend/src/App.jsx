@@ -409,6 +409,7 @@ export default function App() {
   const [files, setFiles] = useState([]);
   const [captureBusy, setCaptureBusy] = useState(false);
   const [attachmentError, setAttachmentError] = useState("");
+  const [evidenceIntake, setEvidenceIntake] = useState(null);
   const [result, setResult] = useState(null);
   const [activeView, setActiveView] = useState("welcome");
   const workspaceRef = useRef(null);
@@ -444,6 +445,23 @@ export default function App() {
   const [detailsFormOpen, setDetailsFormOpen] = useState(false);
   const [judicialDetails, setJudicialDetails] = useState(null);
   const [detailsError, setDetailsError] = useState("");
+
+  const checkEvidenceIntake = async () => {
+    try {
+      const { data } = await axios.get(`${API}/evidence-intake`, { timeout: 15000 });
+      const status = data.ready === true ? { ready: true } : { ready: false, message: data.message || "Evidence uploads are temporarily unavailable. You can submit a report without attachments." };
+      setEvidenceIntake(status);
+      return status;
+    } catch {
+      const status = { ready: false, message: "Could not check evidence upload availability. Retry the check, or submit a report without attachments." };
+      setEvidenceIntake(status);
+      return status;
+    }
+  };
+
+  useEffect(() => {
+    if (activeView === "report") checkEvidenceIntake();
+  }, [activeView]);
 
   useEffect(() => {
     const titles = { welcome: "Getting started", report: "Submit a report", track: "Track a case", dashboard: "Authority access" };
@@ -502,6 +520,10 @@ export default function App() {
     if (error) { setAttachmentError(error); return; }
     setSubmitting(true);
     try {
+      if (files.length) {
+        const intake = await checkEvidenceIntake();
+        if (!intake.ready) { setResult({ error: intake.message }); return; }
+      }
       const toSend = {
         title,
         description: acceptedAnonymized ? anonymizedDescription : description,
@@ -1110,7 +1132,8 @@ export default function App() {
                     <span className="mono">OPTIONAL</span>
                   </div>
                   <h2 className="panel-title">Add supporting evidence.</h2>
-                  <EvidenceCapture onAdd={addEvidence} onBusy={setCaptureBusy} disabled={submitting || files.length >= 5} remainingBytes={MAX_EVIDENCE_BYTES - files.reduce((sum, file) => sum + file.size, 0)} />
+                  {!evidenceIntake?.ready && <div className="inline-warning" role="status"><p>{evidenceIntake?.message || "Checking evidence upload availability…"}</p>{evidenceIntake && <button type="button" onClick={checkEvidenceIntake}>Retry availability check</button>}</div>}
+                  <EvidenceCapture onAdd={addEvidence} onBusy={setCaptureBusy} disabled={submitting || files.length >= 5 || !evidenceIntake?.ready} remainingBytes={MAX_EVIDENCE_BYTES - files.reduce((sum, file) => sum + file.size, 0)} />
                   <label className="drop-zone">
                     <span className="drop-icon"><NavIcon name="upload" /></span>
                     <strong>Browse evidence files <span aria-hidden="true">↗</span></strong>
@@ -1121,7 +1144,7 @@ export default function App() {
                       type="file"
                       accept="image/jpeg,image/png,video/mp4,video/webm,audio/webm,audio/wav,audio/mpeg,audio/mp4,audio/ogg,.weba,.pdf,.txt"
                       multiple
-                      disabled={submitting || captureBusy}
+                      disabled={submitting || captureBusy || !evidenceIntake?.ready}
                       onChange={(e) => { addEvidence(Array.from(e.target.files)); e.target.value = ""; }}
                     />
                   </label>

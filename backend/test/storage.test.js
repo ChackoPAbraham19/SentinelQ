@@ -34,7 +34,11 @@ test('only encrypted bytes can be uploaded, without filenames or public URLs', a
   const { sealOriginal } = require('../court-vault');
   const { keys } = require('../test-support/court');
   await storage.writeArtifact('CASE-TEST-001.original', sealOriginal(Buffer.from('private recording'), 'evidence:CASE-TEST:source.original', keys.publicKey));
-  assert.equal(called, 2);
+  const pqc = require('../post-quantum');
+  const encrypted = pqc.encrypt(Buffer.from('post-quantum recording'), Buffer.alloc(32, 7), 'evidence:CASE-TEST:source.original');
+  assert.equal(encrypted.subarray(0, 4).toString(), 'SQE3');
+  await storage.writeArtifact('CASE-TEST-001.original', encrypted);
+  assert.equal(called, 3);
 });
 test('provider failures fail closed and do not disclose response bodies or secrets', async () => {
   const storage = new SupabaseStorage(env, async () => json({ error: env.SUPABASE_SECRET_KEY }, 403));
@@ -68,4 +72,25 @@ test('missing evidence is distinguished from permission failures', async () => {
   assert.equal(await storage.readArtifact('CASE-TEST.original'), null);
   const denied = new SupabaseStorage(env, async () => json({ error: 'AccessDenied' }, 400));
   await assert.rejects(denied.readArtifact('CASE-TEST.original'));
+});
+
+test('cloud artifact cleanup enumerates only the exact case namespace and deletes via Storage API', async () => {
+  const calls = [];
+  const storage = new SupabaseStorage(env, async (url, options) => {
+    calls.push({ url, options });
+    const body = JSON.parse(options.body);
+    if (url.includes('/object/list/')) {
+      assert.equal(body.prefix, '');
+      assert.equal(body.search, 'CASE-TEST-');
+      assert.equal(body.limit, 100);
+      return json([{ id: '1', name: 'CASE-TEST-orphan.original' }, { id: '2', name: 'CASE-TEST-copy.sanitized' }, { id: '3', name: 'OTHER-CASE-TEST-file.original' }, { id: null, name: 'folder' }]);
+    }
+    assert.equal(options.method, 'DELETE');
+    assert.deepEqual(body.prefixes, ['CASE-TEST-orphan.original']);
+    return json([]);
+  });
+  assert.deepEqual(await storage.listCaseArtifacts('CASE-TEST'), ['CASE-TEST-orphan.original', 'CASE-TEST-copy.sanitized']);
+  await storage.removeArtifact('CASE-TEST-orphan.original');
+  assert.equal(calls.length, 2);
+  await assert.rejects(storage.listCaseArtifacts('../other'));
 });

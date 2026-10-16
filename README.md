@@ -1,86 +1,250 @@
 # SentinelQ
 
-SentinelQ is a prototype for pseudonymous incident reporting, recovery-key case access, protected evidence storage, and authority review. Its Node API supports local development storage and a connected Supabase database and private evidence bucket. It does **not** provide network anonymity and must not be presented as a Tor-like or production whistleblower platform.
+**Pseudonymous incident reporting with post-quantum encrypted evidence, privacy-masked review copies, and a tamper-evident audit trail.**
 
-## Security model
+SentinelQ lets a reporter submit an incident with supporting evidence, without creating an account, and follow up later using only a Case ID and a recovery key. Authorities review cases through a role-based dashboard that sees privacy-masked copies by default; access to originals is gated, time-limited and audited.
 
-- Case narratives, sensitive metadata, messages, and evidence are encrypted at rest with AES-256-GCM.
-- Ciphertext is bound to its case and artifact identity with authenticated additional data.
-- Sanitized evidence is authenticated, decrypted, hashed with SHA3-256, and compared with an HMAC-signed ledger before the UI reports integrity as verified.
-- Audit records form an HMAC-signed chain. This detects offline modification by an actor who does not possess the audit key; it is not an externally witnessed transparency log.
-- Authority access uses PBKDF2 password verification, expiring opaque sessions, RBAC, assignment checks, bounded inputs, and per-route rate limits.
-- Reporter access uses a high-entropy recovery key. Legacy word-based recovery records remain supported through asynchronous verification.
-- JPEG/PNG images and MP4/WebM videos receive a coarse full-frame blur, including faces. Audio files and video audio use an altered voice while retaining speech; spoken identifiers are not redacted. TXT copies replace non-whitespace with `X`. PDF and processing failures remain quarantined.
-- New originals are AES-GCM encrypted with per-file keys wrapped to an independent custodian’s RSA public key. Only the custodian holds the private key. Original downloads/reprocessing require an admin session, a court-signed release, a recorded reason, and a one-use grant lasting at most 60 seconds. Sensitive case fields retain the separate judicial-key gate. See [custodian setup and release procedure](docs/EVIDENCE_PRIVACY.md).
-- Similar reports are shown only as review candidates. They never raise the evidence-integrity score or count as independent corroboration.
+> **Prototype notice.** SentinelQ is an academic prototype (Cryptography & Network Security project). It encrypts data at rest but does **not** provide network anonymity (no Tor/onion routing). Use it for controlled demonstrations with synthetic data, not as a production whistleblower platform.
 
-## Explicit limitations
+---
 
-- No network anonymity, onion routing, traffic-analysis protection, PQC, ZKP, differential privacy, malware scanner, selective face detection, guaranteed speaker anonymization, spoken-identifier redaction, or working dead-man release mechanism is provided. Media derivatives deliberately sacrifice detail for privacy; they are not substitutes for the original in evidentiary analysis.
-- A deployment host, reverse proxy, network observer, compromised browser, or administrator can still observe metadata.
-- The rule-based privacy helper is advisory and cannot guarantee that text is anonymous.
-- Production deployment requires HTTPS, a trusted reverse proxy, managed key storage, coordinated case/object/audit transactions, backups, monitoring, and an independently anchored audit service. Sessions, download grants, and rate limits remain in process memory; run one Node instance until those are moved to shared storage.
+## Contents
 
-## Run locally
+- [Features](#features)
+- [Cryptography at a glance](#cryptography-at-a-glance)
+- [Tech stack](#tech-stack)
+- [Project structure](#project-structure)
+- [Getting started](#getting-started)
+- [Configuration](#configuration)
+- [Testing](#testing)
+- [Deployment](#deployment)
+- [API overview](#api-overview)
+- [Limitations](#limitations)
+- [Further documentation](#further-documentation)
 
-The ignored `backend/.env` must define unique values of at least the documented lengths. The server fails closed when passwords or keys are missing or use known placeholders.
-For this local demo, `admin` / `admin` can be enabled with `SENTINELQ_ALLOW_DEMO_ADMIN=1` in `backend/.env`. This exception works only when the backend binds to loopback, the frontend origin is local, and `NODE_ENV` is not `production`. Remove the flag and use a unique 16-character-or-longer password before deployment.
-Configure `SENTINELQ_COURT_PUBLIC_KEY` or `SENTINELQ_COURT_PUBLIC_KEY_PATH` with the independent custodian’s public key before accepting evidence. Uploads with attachments fail closed without it. Never configure the custodian private key on this server. Set `SENTINELQ_JUDICIAL_ACCESS_KEY` separately for sensitive case fields. Install FFmpeg or set `SENTINELQ_FFMPEG_PATH`. Admin reprocessing requires a court release. Existing originals retain legacy encryption until an explicit custody migration; no existing data or backups are rewritten automatically. See [evidence privacy](docs/EVIDENCE_PRIVACY.md) for setup, limitations, and verification.
+---
 
-```powershell
-cd backend
-npm start
+## Features
+
+**For reporters**
+- Submit a report with mandatory evidence (JPEG/PNG, MP4/WebM, audio, TXT; PDF is quarantined), up to 5 files / 8 MiB.
+- In-browser camera/microphone capture.
+- Advisory privacy check that flags phone numbers, emails and other identifiers before submission.
+- Optional exact location, encrypted under a separate judicial key.
+- Case ID + high-entropy recovery key; downloadable **ML-DSA-65 signed evidence receipt** verifiable offline.
+- Track a case: status, two-way encrypted messages, and alerts whenever an authority views the case.
+- Emergency controls: **delete** live case contents, or **rotate** the case key (re-encrypt everything, replace the recovery key, pause authority access).
+- Quick-exit button that clears the workspace.
+
+**For authorities**
+- Roles: `ADMIN`, `CASE_MANAGER`, `INVESTIGATOR`, `AUDITOR`, `COURT`, with per-route permission checks and investigator assignment.
+- Case queue with filtering, status/priority changes, assignment, internal notes and redacted summary download.
+- Per-case cryptographic verification matrix (decrypt → SHA3-256 → compare with signed ledger).
+- Similar-report correlation shown as review leads only, never as proof.
+- Original evidence viewing requires the viewer's personal access key, a fresh camera photo, a reason and reference, and yields a one-use grant valid for at most 60 seconds.
+- Verified audit-chain browser.
+
+**Evidence privacy pipeline (FFmpeg)**
+- Images and video: coarse full-frame blur (faces included) and metadata removal.
+- Audio and video soundtracks: altered voice (speech stays audible).
+- Text: every non-whitespace character replaced with `X`.
+- Masking runs in a background worker with leases and bounded retries; on failure the original stays locked.
+
+## Cryptography at a glance
+
+| Purpose | Mechanism |
+|---|---|
+| Data at rest (narratives, messages, evidence, viewer photos) | **ML-KEM-768** + HKDF-SHA512 + **AES-256-GCM**, bound to case/artifact via AAD (`SQE3`/`SQF3`) |
+| Case manifests and evidence receipts | **ML-DSA-65** signatures |
+| Per-case keys | Random key per case, wrapped by the platform storage key |
+| Exact location | Extra envelope under the judicial key |
+| Evidence integrity | SHA3-256 hashes in an HMAC-signed ledger |
+| Audit trail | HMAC-SHA256 hash chain; any edit, insertion or fork is detected and writes fail closed |
+| Authority passwords | PBKDF2 with salt; opaque, expiring sessions |
+
+Post-quantum primitives come from [`@noble/post-quantum`](https://github.com/paulmillr/noble-post-quantum). Details: [docs/POST_QUANTUM.md](docs/POST_QUANTUM.md) and [docs/FEATURES_AND_SECURITY.md](docs/FEATURES_AND_SECURITY.md).
+
+## Tech stack
+
+- **Backend:** Node.js 22 (built-in `http`, no web framework), `@noble/post-quantum`
+- **Frontend:** React 18, bundled with esbuild, axios
+- **Media:** FFmpeg / FFprobe
+- **Storage:** encrypted local files, or Supabase (Postgres + private bucket)
+- **Hosting:** Render blueprint included (`render.yaml`)
+
+## Project structure
+
+```
+.
+├── backend/
+│   ├── index_no_deps.js      # HTTP API server (entry point)
+│   ├── storage.js            # Local and Supabase storage adapters
+│   ├── post-quantum.js       # ML-KEM / ML-DSA envelopes and signatures
+│   ├── case-integrity.js     # Signed case manifests
+│   ├── evidence-worker.js    # Background masking worker
+│   ├── reporter-controls.js  # Alerts, emergency delete / key rotation
+│   ├── court-vault.js        # Sealed originals for court viewers
+│   ├── cloud-setup.js        # Supabase check / one-time migration
+│   ├── test/                 # node:test suites
+│   └── .env.example          # Configuration template
+├── frontend/
+│   ├── src/                  # React components (App.jsx, EvidenceCapture.jsx, ...)
+│   ├── public/               # index.html, runtime-config.js
+│   ├── build.js              # esbuild production build -> dist/
+│   └── dev-server.js         # Local dev server on :3000
+├── scripts/
+│   ├── verify-mvp.js         # One-command verification (tests, build, audits)
+│   ├── verify-receipt.js     # Offline evidence-receipt verifier
+│   └── render-build.js       # Render build step
+├── supabase/migrations/      # Database schema
+├── docs/                     # Design, security and operations docs
+└── render.yaml               # Render deployment blueprint
 ```
 
-In another terminal:
+## Getting started
 
-```powershell
-cd frontend
-npm install
-npm start
+### Prerequisites
+
+- **Node.js 22.13+** (`.nvmrc` provided; run `nvm use`)
+- **npm**
+- **FFmpeg and FFprobe** on `PATH` (`sudo apt install ffmpeg`, `brew install ffmpeg`, or `winget install ffmpeg`)
+
+### 1. Clone and install
+
+```bash
+git clone https://github.com/ChackoPAbraham19/SentinelQ.git
+cd SentinelQ
+nvm use                     # optional, selects Node 22
+npm --prefix backend ci
+npm --prefix frontend ci
 ```
 
-Open `http://localhost:3000`. Local HTTP is for development only. For any non-local deployment set `SENTINELQ_REQUIRE_HTTPS=1`, terminate TLS at the trusted proxy, and set `SENTINELQ_TRUST_PROXY=1` only when direct access to the Node process is blocked.
+### 2. Configure
 
-## Verification
-
-For the public HTTPS deployment, see [Render deployment](docs/DEPLOYMENT.md). The frontend and API share one service; evidence remains in Supabase.
-
-```powershell
-cd backend
-node --test
-
-cd ..\frontend
-npm run build
-npm audit
+```bash
+cp backend/.env.example backend/.env
 ```
 
-The tests use isolated temporary data directories and never touch `backend/data`.
+Open `backend/.env` and replace **every** `replace-...` value. Generate each secret separately:
 
-## Connected Supabase storage
+```bash
+node -e "console.log(require('node:crypto').randomBytes(32).toString('base64url'))"
+```
 
-The current project is `sentinelq` in Mumbai (`ap-south-1`), under FestinBiju's Org. Supabase fits the case, authority, and audit relationships and supports transactional Postgres updates plus private object storage. Firebase can support the application too, but would require adapting the existing backend around Firestore rules and document access patterns. See [database setup and operations](docs/DATABASE.md).
+- `SENTINELQ_STORAGE_KEY`, `SENTINELQ_AUDIT_KEY`, `SENTINELQ_JUDICIAL_ACCESS_KEY`: at least 32 characters, all different.
+- The four `*_PASSWORD` values: at least 16 characters each. These are the passwords for the `admin`, `manager`, `investigator` and `auditor` accounts.
 
-The React app continues calling the Node API. Only Node holds `SUPABASE_SECRET_KEY`; no browser Supabase client or public evidence URL is used. Database tables enable RLS and deny browser roles. Authority passwords are stored as salted PBKDF2 hashes; the existing reporter recovery-key flow is preserved. Sensitive case fields and every attachment are encrypted before reaching Supabase.
+The server refuses to start with missing or placeholder values. See [Configuration](#configuration) for every option.
 
-Set `SUPABASE_URL`, `SUPABASE_SECRET_KEY`, and the existing application keys in ignored `backend/.env`. With the old server stopped, run `node cloud-setup.js --migrate` from `backend`, then set `SENTINELQ_STORAGE_PROVIDER=supabase` and restart. Migration validates ciphertext and signed logs and retains local data. It is for a one-time cutover, not ongoing synchronization. `node cloud-setup.js` checks the connection without migration. The service fails closed on a cloud outage; it does not fall back to local files.
+### 3. Run
 
-## Main API routes
+In two terminals:
 
-- `POST /report-base64` — bounded pseudonymous report and evidence intake.
-- `POST /track` — reporter access using a Case ID and recovery key.
-- `POST /auth/login`, `POST /auth/logout` — authority sessions.
-- `GET /cases`, `GET /cases/:id` — RBAC-filtered authority review.
-- `GET /cases/:id/verify` — artifact-by-artifact cryptographic verification.
-- `GET /cases/:id/verification` — custody-integrity summary plus non-scoring similarity leads.
-- `POST /cases/:id/evidence/:id/reprocess` — court-authorized masked derivative creation using a one-use original grant.
-- `POST /cases/:id/judicial-details` — admin key and reason check for sensitive case fields and original evidence metadata.
-- `POST /cases/:id/evidence/:id/court-request` — admin exports a session-bound request for independent custodian approval.
-- `POST /cases/:id/evidence/:id/original-access` — validates a court-signed release and reason; returns a one-use grant.
-- `GET /cases/:id/evidence/:id?original=1` — original download with the grant in `X-Original-Grant`.
-- `GET /audit` — verified audit-chain events.
-- `POST /ai/analyze` — authority-only; external processing requires explicit per-request consent.
+```bash
+# Terminal 1: API on http://127.0.0.1:4000
+cd backend && npm start
 
-## Secret rotation and migration
+# Terminal 2: UI on http://localhost:3000
+cd frontend && npm start
+```
 
-`backend/migrate_security.js` migrates legacy `SQE1` ciphertext to context-bound `SQE2`, encrypts plaintext case fields, and rebuilds signed local ledger/audit baselines. A legacy migration requires the old key in `SENTINELQ_LEGACY_STORAGE_KEY`; no public fallback key exists. Back up the encrypted vault and keys through an approved secure process before any later rotation. Never commit `backend/.env`.
+Open **http://localhost:3000**. Submit a report, save the Case ID and recovery key, then sign in under **Authority sign in** as `manager` with the password from your `.env`.
+
+> **Local demo shortcut:** set `SENTINELQ_ALLOW_DEMO_ADMIN=1` to allow `admin` / `admin`. This works only on loopback with `NODE_ENV` other than `production`.
+
+## Configuration
+
+All configuration lives in `backend/.env`; [backend/.env.example](backend/.env.example) documents every variable.
+
+| Variable | Required | Description |
+|---|---|---|
+| `SENTINELQ_STORAGE_KEY` | yes | Wraps per-case encryption keys (≥ 32 chars) |
+| `SENTINELQ_AUDIT_KEY` | yes | Signs the audit chain and evidence ledger (≥ 32 chars) |
+| `SENTINELQ_JUDICIAL_ACCESS_KEY` | yes | Encrypts exact locations and sensitive details (≥ 32 chars) |
+| `SENTINELQ_{ADMIN,MANAGER,INVESTIGATOR,AUDITOR}_PASSWORD` | yes | Authority account passwords (≥ 16 chars) |
+| `HOST`, `PORT` | no | API bind address (default `127.0.0.1:4000`) |
+| `ALLOWED_ORIGIN` | no | Frontend origin (default `http://localhost:3000`) |
+| `SENTINELQ_STORAGE_PROVIDER` | no | `local` (default) or `supabase` |
+| `SENTINELQ_DATA_DIR` | no | Local storage folder (default `backend/data`) |
+| `SUPABASE_URL`, `SUPABASE_SECRET_KEY` | cloud only | Supabase project and backend secret key |
+| `SENTINELQ_SEED_DEMO` | no | `1` seeds synthetic demo cases |
+| `SENTINELQ_ALLOW_DEMO_ADMIN` | no | `1` enables `admin`/`admin` locally |
+| `SENTINELQ_REQUIRE_HTTPS`, `SENTINELQ_TRUST_PROXY` | deploy | Set to `1` behind a trusted HTTPS proxy |
+| `SENTINELQ_SERVE_FRONTEND` | deploy | `1` serves the built UI from the API process |
+| `SENTINELQ_FFMPEG_PATH`, `SENTINELQ_FFPROBE_PATH` | no | Media tool paths if not on `PATH` |
+| `GEMINI_API_KEY`, `GEMINI_MODEL`, `AI_BASE_URL`, `AI_MODEL`, `OPENAI_API_KEY` | no | Optional AI briefing; core features work without them |
+
+> **Keep your keys.** Once data exists, changing the storage, audit or judicial key makes existing cases, logs or locations unreadable. Back up `backend/.env` securely and never commit it.
+
+## Testing
+
+Run the full verification from the repository root:
+
+```bash
+node scripts/verify-mvp.js
+```
+
+This checks prerequisites, runs the backend test suite with isolated temporary data (it never touches your `.env` or real data), builds the frontend, and runs `npm audit` on both dependency trees. To run only the tests:
+
+```bash
+cd backend && npm test
+```
+
+Some tests bind local ports 4100–4103 and 4118, so run one suite at a time. Verify a downloaded evidence receipt offline with:
+
+```bash
+node scripts/verify-receipt.js <receipt.json> [trusted-key-id]
+```
+
+## Deployment
+
+`render.yaml` deploys the API and UI as a single HTTPS service on Render with evidence stored in Supabase. Set the secret environment variables in the Render dashboard, never in the repository. See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) and [docs/DATABASE.md](docs/DATABASE.md).
+
+To move existing local data to Supabase: stop the server, set `SUPABASE_URL` and `SUPABASE_SECRET_KEY`, run `node cloud-setup.js --migrate` in `backend/`, then set `SENTINELQ_STORAGE_PROVIDER=supabase`. `node cloud-setup.js` alone checks the connection. In cloud mode the service fails closed on outages and never falls back to local files.
+
+## API overview
+
+| Route | Purpose |
+|---|---|
+| `POST /report-base64` | Submit a report with evidence |
+| `POST /track` | Reporter access with Case ID + recovery key |
+| `POST /track/alerts`, `/track/alerts/ack` | Reporter access alerts |
+| `POST /track/emergency` | Reporter emergency delete or key rotation |
+| `POST /track/resume` | Resume paused authority review |
+| `POST /auth/login`, `/auth/logout` | Authority sessions |
+| `GET /cases`, `GET /cases/:id` | Role-filtered case review |
+| `POST /cases/:id/status`, `/assign`, `/notes` | Case management |
+| `POST /cases/:id/messages` | Encrypted reporter ↔ authority messages |
+| `GET /cases/:id/summary` | Redacted case summary |
+| `GET /cases/:id/verify`, `/verification` | Cryptographic integrity checks |
+| `POST /cases/:id/judicial-details` | Judicial-key access to sensitive fields |
+| `POST /cases/:id/evidence/:id/viewer-challenge`, `/original-access` | Gated original-evidence access |
+| `POST /cases/:id/evidence/:id/reprocess` | Re-create a masked copy |
+| `GET /audit` | Verified audit-chain events |
+| `GET /health`, `GET /readyz` | Health and readiness |
+
+## Limitations
+
+- **No network anonymity.** The host, proxies and network observers can see metadata such as IP addresses. A compromised browser or administrator can still observe activity.
+- Post-quantum protection covers **stored** data and signatures only. It is not post-quantum TLS or end-to-end encryption, and it does not protect against compromise of the host or its secrets. Audit and ledger chains use HMAC.
+- Masking is deliberately coarse: no selective face detection, guaranteed voice anonymity or spoken-identifier redaction. PDFs are quarantined, not sanitised.
+- The privacy checker is advisory; it cannot guarantee text is anonymous.
+- Sessions, grants and rate limits live in process memory, so run a single Node instance.
+- Production use would additionally need managed key storage, backups, monitoring, MFA and an independently anchored audit log.
+
+The full list of implemented and deferred work is in [TODO.md](TODO.md).
+
+## Further documentation
+
+| Document | Contents |
+|---|---|
+| [docs/MVP_SUBMISSION.md](docs/MVP_SUBMISSION.md) | Submission scope, demo walkthrough, verification record |
+| [docs/FEATURES_AND_SECURITY.md](docs/FEATURES_AND_SECURITY.md) | Feature and cryptography guide, demo ideas |
+| [docs/SECURITY_ARCHITECTURE.md](docs/SECURITY_ARCHITECTURE.md) | Security architecture |
+| [docs/POST_QUANTUM.md](docs/POST_QUANTUM.md) | Post-quantum design and compatibility |
+| [docs/EVIDENCE_PRIVACY.md](docs/EVIDENCE_PRIVACY.md) | Masking pipeline and original-access controls |
+| [docs/DATABASE.md](docs/DATABASE.md) | Supabase setup and operations |
+| [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) | Render / HTTPS deployment |
+| [DESIGN.md](DESIGN.md) | UI design language |
+
+`PHASE3_SUMMARY.md`, `QA_COMPLETION_REPORT.md` and the older audit reports in `docs/` are historical and superseded.

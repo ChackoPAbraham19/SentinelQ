@@ -1,13 +1,19 @@
 {
   "name": "sentinelq-backend",
-  "version": "0.1.0",
+  "version": "2.0.0",
   "private": true,
   "main": "index_no_deps.js",
+  "engines": {
+    "node": ">=22.13.0"
+  },
   "scripts": {
     "start": "node index_no_deps.js",
     "migrate:security": "node migrate_security.js",
     "cloud:check": "node cloud-setup.js",
     "cloud:migrate": "node cloud-setup.js --migrate",
     "test": "node --test"
+  },
+  "dependencies": {
+    "@noble/post-quantum": "0.7.1"
   }
 }

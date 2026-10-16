@@ -1,0 +1,172 @@
+Node.js 24.18.0
+
+npm available
+12.0.1
+
+ffmpeg available
+
+ffprobe available
+
+Backend tests (isolated temporary storage)
+▶ comprehensive SentinelQ functionality audit
+  ✔ reporter anonymous submission works (53.3763ms)
+  ✔ reporter can recover a case and send an anonymous reply (89.2766ms)
+  ✔ privacy guardian detects identity exposure (1.4981ms)
+  ✔ categorization works (0.8181ms)
+  ✔ evidence hash is generated and stored (39.2461ms)
+  ✔ authority login with correct credentials (65.0042ms)
+  ✔ authority login with wrong password fails (64.6463ms)
+  ✔ unauthenticated request to /cases is rejected (0.9582ms)
+  ✔ authenticated request to /cases returns cases (58.6564ms)
+  ✔ can view case details when authorized (66.6724ms)
+  ✔ case status can be updated (71.4283ms)
+  ✔ authority can send chat messages (62.5368ms)
+  ✔ verification endpoint returns credibility signals (118.3458ms)
+  ✔ tamper verification detects hash match (49.4459ms)
+  ✔ audit trail records events (137.6601ms)
+  ✔ JPEG privacy work is queued without claiming metadata removal early (37.7534ms)
+  ✔ unprocessed video is queued without a derivative (70.0497ms)
+  ✔ oversized requests are rejected (18.7674ms)
+  ✔ invalid base64 is rejected (37.7442ms)
+  ✔ empty file is rejected (33.3208ms)
+  ✔ privacy check identifies workplace details (1.6624ms)
+  ✔ related cases are identified in verification (266.8616ms)
+✔ comprehensive SentinelQ functionality audit (1777.9493ms)
+✔ anonymization and chat endpoints work (1180.8557ms)
+(node:36780) [MODULE_TYPELESS_PACKAGE_JSON] Warning: Module type of file:///C:/Users/festi/Downloads/PBL%20S7/PBL%20S7/frontend/src/api.js is not specified and it doesn't parse as CommonJS.
+Reparsing as ES module because module syntax was detected. This incurs a performance overhead.
+To eliminate this warning, add "type": "module" to \\?\C:\Users\festi\Downloads\PBL S7\PBL S7\frontend\package.json.
+(Use `node --trace-warnings ...` to show where the warning was created)
+✔ browser client scopes tokens, rejects other origins, clears expired sessions and ignores responses after logout (87.3494ms)
+✔ recording completion removes device listeners so late device events preserve the review (2.7379ms)
+✔ recorder stop errors release the microphone and leave capture ready for retry (0.3305ms)
+✔ cancelling a faulty recorder still releases device tracks without creating a capture (0.1865ms)
+✔ a newer camera request wins when older permissions resolve after restarting capture (0.1556ms)
+✔ evidence upload preserves binary bytes for recorded MIME types containing commas (784.2352ms)
+✔ microphone capture produces a correctly named WebM audio file and stops device tracks (6.744ms)
+✔ late camera permission after cancellation closes tracks without recording (0.276ms)
+✔ photo requests no microphone and closing capture stops the camera (0.1388ms)
+✔ oversized, interrupted and empty recordings fail closed and release devices (2.8299ms)
+✔ permission refusal and unsupported browsers offer a file upload fallback (0.4098ms)
+✔ uploaded and captured evidence share count, format and total-size limits (0.2261ms)
+✔ new case manifests use ML-DSA-65 and survive JSONB key reordering and local revisions (26.1346ms)
+✔ v3 manifests reject workflow, access, evidence, signature and signing-key tampering (22.0123ms)
+✔ signatures cover the persisted JSON shape when optional fields are undefined (3.7558ms)
+✔ v3 cannot be downgraded even with an otherwise valid legacy HMAC (0.3733ms)
+✔ case signatures are domain-separated from signatures over the bare canonical payload (9.8425ms)
+✔ existing v2 HMAC records and unsigned v1 records remain readable; new writes upgrade v2 (3.7046ms)
+✔ originals can only be decrypted by independently released per-file keys (4.6712ms)
+✔ server accepts only strong public keys and fails closed without a custodian (37.8847ms)
+✔ custody invites expire, require possession, are single use, and cannot replace a registered key (14.9134ms)
+✔ browser recovery file works with offline court release, rejects wrong passwords and tampering (545.1516ms)
+✔ cloud enrollment only inserts public configuration and cannot overwrite it (12.8928ms)
+✔ admin/admin demo exception refuses production and non-loopback startup (189.2803ms)
+✔ missing custodian configuration does not block evidence submissions (1821.8077ms)
+✔ invalid custodian configuration does not block evidence submissions (430.4707ms)
+✔ production assets use the same origin and cannot expose server files (155.5241ms)
+✔ media derivatives mask images, video, text and speech while keeping encrypted originals (6059.2351ms)
+✔ reporter, manager, investigator and auditor complete assignment, notes, chat and closure with role boundaries (1895.5357ms)
+✔ case credentials, messages, court accounts and viewer keys survive restart while sessions and grants expire (2124.7098ms)
+✔ audit failures do not commit status, assignment, note or reporter-message mutations (565.681ms)
+✔ manual masking never publishes a review copy when the required access audit is unavailable (924.7781ms)
+✔ a single-use masked-evidence link releases exactly one copy under concurrent requests (556.201ms)
+✔ SQE3 uses randomized ML-KEM encapsulation and AES-GCM for empty and binary payloads (17.8193ms)
+✔ SQE3 rejects wrong keys, contexts, and mutations in every envelope region (7.3273ms)
+✔ SQE3 fails closed on truncation, extension, concatenation, unsupported versions and bad types (2.6038ms)
+✔ ML-DSA-65 signatures validate messages and reject mutations, aliases and wrong keys (54.5019ms)
+✔ key regeneration after cache eviction and a fresh process preserves decryption and verification (107.0527ms)
+✔ ML-KEM and ML-DSA interoperate with independent native OpenSSL implementations (11.1137ms)
+✔ new reports, evidence and chat use lattice-based envelopes and signed manifests (744.7212ms)
+✔ v3 manifest corruption, deletion and HMAC downgrade fail closed through report tracking (539.6078ms)
+✔ minimal report intake persists a verifiable v3 manifest with absent optional fields (458.0563ms)
+✔ v2 encrypted cases and lost-response receipts remain readable and upgrade on mutation (474.9866ms)
+✔ deletion revokes access even during object-store failure and its signed cleanup journal retries safely (94.5127ms)
+✔ interrupted rotation keeps the old complaint usable and restart cleanup only removes staged copies (112.8614ms)
+✔ case-scoped erasure also finds abandoned artifact versions without touching another case (44.5184ms)
+✔ reporter alert pagination is scoped, bounded and has no gaps (28.3458ms)
+✔ offline receipt verifier rejects substituted keys, altered claims and malformed encodings (7.7605ms)
+✔ proof is required on every intake route and invalid proof leaves no stored complaint (502.1103ms)
+✔ private duplicate checking survives changed titles, new tokens, races and restart while receipt retries work (1013.7806ms)
+✔ exact location requires its cryptographic judicial key and never appears in ordinary views (756.2322ms)
+✔ reporters receive durable, isolated alerts for case lists, reads, messages, evidence, verification and judicial access (1409.6789ms)
+✔ emergency rotation re-encrypts all contents, invalidates the old key and grants, pauses review, and retries safely (1995.1932ms)
+✔ emergency deletion removes live contents and evidence, prevents resurrection and keeps only a minimal tombstone (1340.8721ms)
+✔ downloadable evidence receipt verifies with its ML-DSA public key without storage secrets (461.2662ms)
+▶ SentinelQ security and IDOR tests
+  ✔ IDOR: cannot access case without permission (46.5142ms)
+  ✔ Original evidence access requires evidence:original permission (823.4873ms)
+  ✔ Non-existent case returns 404 (0.9928ms)
+  ✔ Non-existent evidence returns 404 (41.6686ms)
+  ✔ Chat messages are encrypted at rest (73.1429ms)
+  ✔ Duplicate evidence is detected and counted (132.2035ms)
+  ✔ Verification shows correlation properly (160.433ms)
+  ✔ Audit trail logs sensitive operations (148.0251ms)
+  ✔ Login/Logout are audited (92.0627ms)
+  ✔ Different files produce different hashes (87.3609ms)
+  ✔ Same file produces same hash (102.3378ms)
+  ✔ Case summary can be generated (77.0723ms)
+  ✔ Logout invalidates session (71.1809ms)
+  ✔ Categorization is deterministic (1.0612ms)
+  ✔ Credibility scores are deterministic (330.2186ms)
+  ✔ PNG text chunks are stripped (49.7316ms)
+  ✔ INVESTIGATOR role only sees assigned cases (421.1203ms)
+  ✔ Status change is audited (481.1178ms)
+  ✔ OPTIONS request is handled (CORS preflight) (1.0798ms)
+  ✔ accepted masking preserves the encrypted source narrative for judicial access (154.0456ms)
+  ✔ case narrative is encrypted at rest (103.3723ms)
+  ✔ malformed encoded paths return 400 without crashing the server (13.1977ms)
+  ✔ magic-byte mismatches are rejected (56.558ms)
+  ✔ same-name evidence receives collision-resistant artifact names (122.874ms)
+  ✔ verification dashboard reports cryptographic tampering (461.9051ms)
+✔ SentinelQ security and IDOR tests (4566.6685ms)
+✔ cloud mode rejects insecure URLs, frontend keys and unknown providers (0.7925ms)
+✔ cloud startup refuses a publicly readable evidence bucket (12.085ms)
+✔ only encrypted bytes can be uploaded, without filenames or public URLs (69.7996ms)
+✔ provider failures fail closed and do not disclose response bodies or secrets (0.7345ms)
+✔ stale cloud updates surface a revision conflict (0.4096ms)
+✔ audit append retries from the current head after a concurrent writer (0.8096ms)
+✔ missing evidence is distinguished from permission failures (0.3709ms)
+✔ cloud artifact cleanup enumerates only the exact case namespace and deletes via Storage API (0.8571ms)
+✔ v2 rejects malformed bodies, total upload overflow, unauthenticated enumeration and cross-origin submission (728.8926ms)
+✔ lost-response retries return the same private receipt; changed payloads cannot reuse the token (536.7065ms)
+✔ a missing masker never delays the report receipt or exposes unprocessed media (592.235ms)
+✔ v2 case tampering and signature removal fail closed, even when field ciphertext was not altered (505.2814ms)
+✔ account throttling survives changing proxy source addresses, and sign-out revokes sessions (1074.2601ms)
+✔ slow masking holds no request open and commits only after signed ledger and audit, preserving concurrent messages (23.5527ms)
+✔ worker restart recovers an expired lease and preserves stable evidence aliases (15.6789ms)
+✔ live leases are not stolen; repeated crash attempts become terminal (47.4997ms)
+✔ processor failure retries a bounded number of times without releasing any copy (47.5103ms)
+✔ original-hash failure retries a bounded number of times without releasing any copy (47.3464ms)
+✔ ledger failure retries a bounded number of times without releasing any copy (46.0162ms)
+✔ storage failure retries a bounded number of times without releasing any copy (47.3608ms)
+✔ audit failure retries a bounded number of times without releasing any copy (46.7912ms)
+✔ two workers use one CAS claim; stale completion cannot replace a new claim (47.1253ms)
+✔ v2 manifests detect role/workflow tampering, key reordering, swaps and unsigned downgrade (26.5106ms)
+✔ FFmpeg receives no application keys, provider tokens or account passwords (0.4872ms)
+ℹ tests 129
+ℹ suites 0
+ℹ pass 129
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 39676.5797
+
+Frontend production build
+
+backend dependency audit
+found 0 vulnerabilities
+
+frontend dependency audit
+found 0 vulnerabilities
+
+Verification results
+PASS Installed dependencies
+PASS npm available
+PASS ffmpeg available
+PASS ffprobe available
+PASS Backend tests (isolated temporary storage)
+PASS Frontend production build
+PASS backend dependency audit
+PASS frontend dependency audit
+Physical devices and deployed infrastructure require separate checks; see docs/MVP_SUBMISSION.md.

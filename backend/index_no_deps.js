@@ -3,11 +3,17 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const os = require('os');
-const { execFile } = require('child_process');
+const { withMediaSlot, runFFmpeg } = require('./media-runtime');
 const { createStorage, StorageError } = require('./storage');
 const { createFrontend } = require('./frontend');
 const courtVault = require('./court-vault');
 const { sanitizeViewerPhoto } = require('./viewer-photo');
+const { sealCase, verifyCase, canonical } = require('./case-integrity');
+const { createEvidenceWorker, jobPending } = require('./evidence-worker');
+const postQuantum = require('./post-quantum');
+const reporterSecurity = require('./reporter-security');
+const { createReporterControls } = require('./reporter-controls');
+const withCaseLock = reporterSecurity.createSerialQueue();
 
 if (process.env.SENTINELQ_SKIP_ENV_FILE !== '1') {
   loadEnvFile(path.join(__dirname, '.env'));
@@ -34,6 +40,8 @@ const evidenceLinks = new Map();
 const originalGrants = new Map();
 const viewerChallenges = new Map();
 const rateBuckets = new Map();
+const loginAttempts = new Map();
+let activeReports = 0;
 let lastRatePruneAt = 0;
 const ROLE_PERMISSIONS = Object.freeze({
   ADMIN: ['courts:create', 'cases:read', 'cases:write', 'chat:read', 'chat:write', 'evidence:read', 'evidence:original', 'evidence:verify', 'audit:read', 'notes:read', 'notes:write', 'assign:write'],
@@ -56,8 +64,9 @@ function corsHeaders(extra = {}) {
     'Cross-Origin-Resource-Policy': 'same-site',
     'Access-Control-Allow-Origin': ALLOWED_ORIGIN,
     'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Original-Grant',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Original-Grant, X-Submission-Token',
     'Access-Control-Expose-Headers': 'Content-Disposition',
+    'Vary': 'Origin',
     ...extra
   };
 }
@@ -70,18 +79,21 @@ function sendJson(res, obj, status=200){
 
 function clientKey(req){
   if (TRUST_PROXY && req.headers['x-forwarded-for']) {
-    return String(req.headers['x-forwarded-for']).split(',')[0].trim().slice(0, 64);
+    // The trusted proxy appends the peer it observed. Never trust a caller's
+    // leftmost X-Forwarded-For entry to bypass throttling.
+    return String(req.headers['x-forwarded-for']).split(',').at(-1).trim().slice(0, 64);
   }
   return String(req.socket.remoteAddress || 'local').slice(0, 64);
 }
 
 function rateLimited(req, res){
-  const routeClass = req.url.startsWith('/auth/login') || req.url.startsWith('/viewer-key') || req.url.includes('/original-access') || req.url.includes('/viewer-challenge') || req.url.includes('/court-request') || req.url.includes('/judicial-details') ? 'login'
+  const routeClass = req.url.startsWith('/track/emergency') ? 'emergency'
+    : req.url.startsWith('/auth/login') || req.url.startsWith('/viewer-key') || req.url.includes('/original-access') || req.url.includes('/viewer-challenge') || req.url.includes('/court-request') || req.url.includes('/judicial-details') ? 'login'
     : req.url.startsWith('/track') ? 'recovery'
       : req.url.startsWith('/report') ? 'report'
         : req.url.startsWith('/ai/') ? 'ai'
           : 'general';
-  const limits = { login: 8, recovery: 12, report: 20, ai: 20, general: 180 };
+  const limits = { emergency: 6, login: 8, recovery: 12, report: 20, ai: 20, general: 180 };
   const key = `${clientKey(req)}:${routeClass}`;
   const now = Date.now();
   if (now - lastRatePruneAt > 60000 || rateBuckets.size >= 10000) {
@@ -96,12 +108,13 @@ function rateLimited(req, res){
   }
   const bucket = rateBuckets.get(key) || [];
   const recent = bucket.filter(ts => now - ts < 60000);
-  recent.push(now);
-  rateBuckets.set(key, recent);
-  if (recent.length > limits[routeClass] * RATE_LIMIT_MULTIPLIER) {
+  if (recent.length >= limits[routeClass] * RATE_LIMIT_MULTIPLIER) {
+    res.setHeader('Retry-After', '60');
     sendJson(res, { ok: false, error: 'too many requests' }, 429);
     return true;
   }
+  recent.push(now);
+  rateBuckets.set(key, recent);
   return false;
 }
 
@@ -111,22 +124,55 @@ function getSession(req){
   const session = token ? sessions.get(token) : null;
   if (!session) return null;
   const now = Date.now();
-  if (now - session.lastSeenAt > SESSION_IDLE_MS || now - session.createdAt > SESSION_ABSOLUTE_MS) {
-    sessions.delete(token);
+  if (!sessionActive(session)) {
+    revokeSession(token);
     return null;
   }
   session.lastSeenAt = now;
   return session;
 }
 
+function sessionActive(session) {
+  return session && !session.revoked && Date.now() - session.lastSeenAt <= SESSION_IDLE_MS && Date.now() - session.createdAt <= SESSION_ABSOLUTE_MS;
+}
+function revokeSession(token) {
+  const session = sessions.get(token);
+  if (!session) return;
+  session.revoked = true;
+  sessions.delete(token);
+  for (const [id, entry] of viewerChallenges) if (entry.session === session) viewerChallenges.delete(id);
+  for (const [id, grant] of originalGrants) if (grant.session === session) { grant.dataKey?.fill(0); originalGrants.delete(id); }
+}
+
+function loginAttemptAllowed(username) {
+  const now = Date.now();
+  for (const [key, entry] of loginAttempts) if (entry.until <= now) loginAttempts.delete(key);
+  const key = crypto.createHash('sha256').update(username.toLowerCase()).digest('hex');
+  if (!loginAttempts.has(key) && loginAttempts.size >= 5000) return false;
+  const entry = loginAttempts.get(key) || { count: 0, until: now + 15 * 60 * 1000 };
+  // Reserve before PBKDF2: parallel/distributed guesses share the same budget.
+  if (entry.count >= 8 * RATE_LIMIT_MULTIPLIER) return false;
+  entry.count++;
+  loginAttempts.set(key, entry);
+  return true;
+}
+
 function requirePermission(req, res, permission, caseObj){
   const session = getSession(req);
-  if (!session || !ROLE_PERMISSIONS[session.role]?.includes(permission)) {
-    sendJson(res, { ok: false, error: 'authority authentication required' }, 401);
+  if (!session) {
+    sendJson(res, { ok: false, error: 'authority authentication required', code: 'SESSION_EXPIRED' }, 401);
+    return null;
+  }
+  if (!ROLE_PERMISSIONS[session.role]?.includes(permission)) {
+    sendJson(res, { ok: false, error: 'Your role does not permit this action' }, 403);
     return null;
   }
   if (caseObj && session.role === 'INVESTIGATOR' && !((caseObj.assignedTo || []).includes(session.username))) {
     sendJson(res, { ok: false, error: 'case access denied' }, 403);
+    return null;
+  }
+  if (caseObj?.reviewLocked) {
+    sendJson(res, { ok: false, error: 'The reporter has paused authority access after replacing the case key.', code: 'REVIEW_PAUSED' }, 423);
     return null;
   }
   return session;
@@ -141,12 +187,30 @@ async function auditEvent(event, session, caseId, details = {}){
   });
 }
 
+// One chain verification for many per-case records (e.g. a case list view).
+async function auditEvents(event, session, caseIds){
+  if (!vault.appendLogs) {
+    for (const caseId of caseIds) await auditEvent(event, session, caseId);
+    return;
+  }
+  return vault.appendLogs('audit', lines => {
+    if (!verifySignedLines(lines)) throw new Error('audit log integrity check failed');
+    let previousLine = lines.at(-1);
+    return caseIds.map(caseId => {
+      const previousHash = previousLine ? computeHash(Buffer.from(previousLine)) : 'GENESIS';
+      const payload = { event, actor: session?.username || 'anonymous', role: session?.role || null, caseId: caseId || null, timestamp: new Date().toISOString(), previousHash };
+      previousLine = JSON.stringify({ ...payload, mac: signRecord(payload) });
+      return previousLine;
+    });
+  });
+}
+
 function pruneSessions(){
   const now = Date.now();
   for (const [token, session] of sessions) {
-    if (now - session.lastSeenAt > SESSION_IDLE_MS || now - session.createdAt > SESSION_ABSOLUTE_MS) sessions.delete(token);
+    if (!sessionActive(session)) revokeSession(token);
   }
-  while (sessions.size >= 5000) sessions.delete(sessions.keys().next().value);
+  while (sessions.size >= 5000) revokeSession(sessions.keys().next().value);
 }
 
 function pruneEvidenceLinks(){
@@ -161,6 +225,17 @@ function pruneOriginalGrants(){
 }
 const grantCleanup = setInterval(pruneOriginalGrants, 10000);
 grantCleanup.unref();
+let retiredCleanupTimer, retiredCleanupRunning = false;
+async function cleanupRetiredArtifacts() {
+  if (retiredCleanupRunning) return;
+  retiredCleanupRunning = true;
+  try {
+    for (const row of await vault.listCases()) {
+      if (row.payload.cleanupScanPending || row.payload.cleanupArtifacts?.length || row.payload.stagedArtifacts?.length) await withCaseLock(row.payload.id, () => reporterControls.cleanup(row.payload.id));
+    }
+  } catch { console.error(JSON.stringify({ event: 'RETIRED_ARTIFACT_CLEANUP_PENDING' })); }
+  finally { retiredCleanupRunning = false; }
+}
 
 function consumeOriginalGrant(req, session, id, file) {
   const token = String(req.headers['x-original-grant'] || '');
@@ -201,6 +276,19 @@ function verifySignedLines(lines){
 }
 
 function readJson(req, callback, maxBytes = 64 * 1024){
+  return new Promise(resolve => {
+  const deliver = (value, error) => {
+    const action = () => callback(value, error);
+    const work = req.url.startsWith('/track') && validCaseId(value?.caseId)
+      ? () => withCaseLock(value.caseId, action) : action;
+    Promise.resolve().then(work).catch(failure => requestFailure(req.res, failure)).finally(resolve);
+  };
+  if (!/^application\/json(?:\s*;\s*charset=utf-8)?$/i.test(req.headers['content-type'] || '')) {
+    sendJson(req.res, { ok: false, error: 'application/json required' }, 415);
+    req.resume();
+    resolve();
+    return;
+  }
   const chunks = [];
   let size = 0;
   let finished = false;
@@ -208,6 +296,7 @@ function readJson(req, callback, maxBytes = 64 * 1024){
   if (declared > maxBytes) {
     sendJson(req.res, { ok: false, error: 'request too large' }, 413);
     req.resume();
+    resolve();
     return;
   }
   req.on('data', chunk => {
@@ -217,6 +306,7 @@ function readJson(req, callback, maxBytes = 64 * 1024){
       finished = true;
       chunks.length = 0;
       sendJson(req.res, { ok: false, error: 'request too large' }, 413);
+      resolve();
       return;
     }
     chunks.push(chunk);
@@ -225,14 +315,28 @@ function readJson(req, callback, maxBytes = 64 * 1024){
     if (finished) return;
     finished = true;
     let value;
-    try { value = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}'); }
-    catch (error) { Promise.resolve().then(() => callback(null, error)).catch(failure => requestFailure(req.res, failure)); return; }
-    Promise.resolve().then(() => callback(value, null)).catch(error => requestFailure(req.res, error));
+    try {
+      value = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}');
+      if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('JSON object required');
+      const pending = [[value, 0]];
+      while (pending.length) {
+        const [item, depth] = pending.pop();
+        if (depth > 12) throw new Error('JSON nesting too deep');
+        for (const [key, child] of Object.entries(item)) {
+          if (['__proto__', 'prototype', 'constructor'].includes(key)) throw new Error('Reserved property');
+          if (child && typeof child === 'object') pending.push([child, depth + 1]);
+        }
+      }
+    }
+    catch (error) { deliver(null, error); return; }
+    deliver(value, null);
   });
   req.on('error', error => {
     if (finished) return;
     finished = true;
-    Promise.resolve().then(() => callback(null, error)).catch(failure => requestFailure(req.res, failure));
+    deliver(null, error);
+  });
+  req.on('aborted', () => { if (!finished) { finished = true; resolve(); } });
   });
 }
 
@@ -260,11 +364,17 @@ function hashPassword(password, salt = crypto.randomBytes(16).toString('hex')){
 
 function verifyPassword(password, encoded, callback){
   const [, iterations, salt, expected] = String(encoded).split('$');
-  if (!iterations || !salt || !expected) return callback(false);
+  if (typeof password !== 'string' || password.length > 256 || !/^[a-f0-9]{32}$/.test(salt || '') || !/^[a-f0-9]{64}$/.test(expected || '') || !Number.isInteger(Number(iterations)) || Number(iterations) < 100000 || Number(iterations) > 1000000) return callback(false);
   crypto.pbkdf2(String(password), salt, Number(iterations), 32, 'sha256', (error, derived) => {
     const actual = error ? '' : derived.toString('hex');
     callback(!error && actual.length === expected.length && crypto.timingSafeEqual(Buffer.from(actual), Buffer.from(expected)));
   });
+}
+
+async function hashPasswordAsync(password) {
+  const salt = crypto.randomBytes(16).toString('hex');
+  const derived = await new Promise((resolve, reject) => crypto.pbkdf2(password, salt, 600000, 32, 'sha256', (error, key) => error ? reject(error) : resolve(key)));
+  return `pbkdf2$600000$${salt}$${derived.toString('hex')}`;
 }
 
 function hashRecoverySecret(caseId, secret){
@@ -273,9 +383,11 @@ function hashRecoverySecret(caseId, secret){
 
 function verifyRecoverySecret(caseObj, secret, callback){
   if (!caseObj?.recoveryHash) {
-    crypto.pbkdf2(String(secret), 'sentinelq-invalid-recovery', 120000, 32, 'sha256', () => callback(false));
+    hashRecoverySecret('CASE-INVALID', typeof secret === 'string' ? secret.slice(0, 256) : '');
+    callback(false);
     return;
   }
+  if (typeof secret !== 'string' || secret.length > 256) return callback(false);
   const expected = String(caseObj.recoveryHash);
   if (expected.startsWith('hmac$')) {
     const actual = hashRecoverySecret(caseObj.id, secret);
@@ -300,7 +412,7 @@ function generateReporterId(){
 }
 
 function generateCaseId(){
-  return 'CASE-' + Date.now().toString(36).toUpperCase() + crypto.randomBytes(8).toString('hex').toUpperCase();
+  return 'CASE-V3-' + crypto.randomBytes(16).toString('hex').toUpperCase();
 }
 
 function safeDecode(value, res){
@@ -329,58 +441,71 @@ function appendTimeline(caseObj, label, detail){
 
 async function saveCase(caseObj){
   if (!validCaseId(caseObj?.id)) throw new Error('invalid case id');
-  const revision = await vault.saveCase(caseObj.id, encryptCaseFields(caseObj), caseObj._revision || 0);
+  caseObj.processingPending = (caseObj.files || []).some(jobPending);
+  const revision = await vault.saveCase(caseObj.id, sealCase(encryptCaseFields(caseObj), getStorageKey()), caseObj._revision || 0);
   Object.defineProperty(caseObj, '_revision', { value: revision, writable: true, configurable: true });
 }
 
-function encryptField(value, caseId, field){
+function caseDataKey(record) { return reporterSecurity.unwrapCaseKey(record, getStorageKey()); }
+
+function encryptField(value, caseId, field, key = getStorageKey()){
   if (value === null || value === undefined || value === '') return value;
-  if (typeof value === 'string' && value.startsWith('SQF2:')) return value;
-  return `SQF2:${encryptBuffer(Buffer.from(String(value)), `case:${caseId}:${field}`).toString('base64')}`;
+  return `SQF3:${encryptBuffer(Buffer.from(String(value)), `case:${caseId}:${field}`, key).toString('base64')}`;
 }
 
-function decryptField(value, caseId, field){
-  if (typeof value !== 'string' || !value.startsWith('SQF2:')) return value;
-  return decryptBuffer(Buffer.from(value.slice(5), 'base64'), `case:${caseId}:${field}`).toString('utf8');
+function decryptField(value, caseId, field, key = getStorageKey()){
+  if (typeof value !== 'string' || !/^SQF[23]:/.test(value)) return value;
+  const bytes = Buffer.from(value.slice(5), 'base64');
+  if (value.startsWith('SQF3:') && bytes.subarray(0, 4).toString() !== 'SQE3') throw new Error('Field encryption version mismatch');
+  return decryptBuffer(bytes, `case:${caseId}:${field}`, key).toString('utf8');
 }
 
 function encryptCaseFields(caseObj){
   const next = JSON.parse(JSON.stringify(caseObj));
   const id = next.id;
-  for (const field of ['reporterId', 'title', 'description', 'originalDescription', 'involved', 'incidentDate']) {
-    next[field] = encryptField(next[field], id, field);
+  const key = caseDataKey(caseObj);
+  const enc = (value, field) => encryptField(value, id, field, key);
+  for (const field of ['reporterId', 'title', 'description', 'originalDescription', 'involved', 'incidentDate', 'locationEnvelope']) {
+    next[field] = enc(next[field], field);
   }
-  next.assignedTo = (next.assignedTo || []).map((value, index) => encryptField(value, id, `assignedTo:${index}`));
-  next.notes = (next.notes || []).map((note, index) => ({ ...note, author: encryptField(note.author, id, `notes:${index}:author`), text: encryptField(note.text, id, `notes:${index}:text`) }));
-  next.timeline = (next.timeline || []).map((item, index) => ({ ...item, detail: encryptField(item.detail, id, `timeline:${index}:detail`) }));
+  next.assignedTo = (next.assignedTo || []).map((value, index) => enc(value, `assignedTo:${index}`));
+  next.notes = (next.notes || []).map((note, index) => ({ ...note, author: enc(note.author, `notes:${index}:author`), text: enc(note.text, `notes:${index}:text`) }));
+  next.timeline = (next.timeline || []).map((item, index) => ({ ...item, detail: enc(item.detail, `timeline:${index}:detail`) }));
   next.files = (next.files || []).map((file, index) => ({
     ...file,
-    original: encryptField(file.original, id, `files:${index}:original`),
-    originalHash: encryptField(file.originalHash, id, `files:${index}:originalHash`),
-    sanitizedHash: encryptField(file.sanitizedHash, id, `files:${index}:sanitizedHash`),
-    hash: encryptField(file.hash, id, `files:${index}:hash`),
-    privacyVersion: file.privacyVersion === PRIVACY_DERIVATIVE_VERSION ? encryptField(String(file.privacyVersion), id, `files:${index}:privacyVersion`) : null
+    original: enc(file.original, `files:${index}:original`),
+    originalHash: enc(file.originalHash, `files:${index}:originalHash`),
+    sanitizedHash: enc(file.sanitizedHash, `files:${index}:sanitizedHash`),
+    hash: enc(file.hash, `files:${index}:hash`),
+    privacyVersion: file.privacyVersion === PRIVACY_DERIVATIVE_VERSION ? enc(String(file.privacyVersion), `files:${index}:privacyVersion`) : null
   }));
+  key.fill(0);
   return next;
 }
 
 function decryptCaseFields(caseObj){
+  verifyCase(caseObj, getStorageKey());
   const next = JSON.parse(JSON.stringify(caseObj));
+  delete next._integrity;
+  delete next._localRevision;
   const id = next.id;
-  for (const field of ['reporterId', 'title', 'description', 'originalDescription', 'involved', 'incidentDate']) {
-    next[field] = decryptField(next[field], id, field);
+  const key = caseDataKey(caseObj);
+  const dec = (value, field) => decryptField(value, id, field, key);
+  for (const field of ['reporterId', 'title', 'description', 'originalDescription', 'involved', 'incidentDate', 'locationEnvelope']) {
+    next[field] = dec(next[field], field);
   }
-  next.assignedTo = (next.assignedTo || []).map((value, index) => decryptField(value, id, `assignedTo:${index}`));
-  next.notes = (next.notes || []).map((note, index) => ({ ...note, author: decryptField(note.author, id, `notes:${index}:author`), text: decryptField(note.text, id, `notes:${index}:text`) }));
-  next.timeline = (next.timeline || []).map((item, index) => ({ ...item, detail: decryptField(item.detail, id, `timeline:${index}:detail`) }));
+  next.assignedTo = (next.assignedTo || []).map((value, index) => dec(value, `assignedTo:${index}`));
+  next.notes = (next.notes || []).map((note, index) => ({ ...note, author: dec(note.author, `notes:${index}:author`), text: dec(note.text, `notes:${index}:text`) }));
+  next.timeline = (next.timeline || []).map((item, index) => ({ ...item, detail: dec(item.detail, `timeline:${index}:detail`) }));
   next.files = (next.files || []).map((file, index) => ({
     ...file,
-    original: decryptField(file.original, id, `files:${index}:original`),
-    originalHash: decryptField(file.originalHash, id, `files:${index}:originalHash`),
-    sanitizedHash: decryptField(file.sanitizedHash, id, `files:${index}:sanitizedHash`),
-    hash: decryptField(file.hash, id, `files:${index}:hash`),
-    privacyVersion: typeof file.privacyVersion === 'string' && file.privacyVersion.startsWith('SQF2:') && decryptField(file.privacyVersion, id, `files:${index}:privacyVersion`) === String(PRIVACY_DERIVATIVE_VERSION) ? PRIVACY_DERIVATIVE_VERSION : null
+    original: dec(file.original, `files:${index}:original`),
+    originalHash: dec(file.originalHash, `files:${index}:originalHash`),
+    sanitizedHash: dec(file.sanitizedHash, `files:${index}:sanitizedHash`),
+    hash: dec(file.hash, `files:${index}:hash`),
+    privacyVersion: typeof file.privacyVersion === 'string' && /^SQF[23]:/.test(file.privacyVersion) && dec(file.privacyVersion, `files:${index}:privacyVersion`) === String(PRIVACY_DERIVATIVE_VERSION) ? PRIVACY_DERIVATIVE_VERSION : null
   }));
+  key.fill(0);
   return next;
 }
 
@@ -392,10 +517,13 @@ function safeDownloadName(value){
 function redactCase(caseObj, { includeMessages = false, includeNotes = false } = {}){
   const next = { ...normalizeCase(caseObj) };
   delete next.recoveryHash;
+  delete next.submissionHash;
   delete next.originalDescription;
   delete next.reporterId;
   delete next.involved;
   delete next.incidentDate;
+  for (const field of ['keyEnvelope', 'locationEnvelope', 'complaintFingerprint', 'emergencyOperation', 'cleanupArtifacts', 'stagedArtifacts', 'alertsSeenThrough']) delete next[field];
+  next.location = caseObj.locationEnvelope ? 'Encrypted — judicial key required' : 'Not provided';
   next.title = next.title ? anonymizeText(next.title) : '';
   next.description = next.description ? anonymizeText(next.description) : '';
   next.files = (next.files || []).map((file, index) => ({
@@ -406,7 +534,7 @@ function redactCase(caseObj, { includeMessages = false, includeNotes = false } =
     derivativeMime: file.derivativeMime || file.mime,
     size: file.size,
     sanitizedHash: file.sanitizedHash,
-    processingStatus: canDownloadMaskedCopy(file) ? file.processingStatus : file.mime === 'application/pdf' ? 'QUARANTINED' : 'NEEDS_MASKING',
+    processingStatus: evidenceStatus(file),
     processingError: file.processingError,
     transformations: file.transformations,
     maskedCopyAvailable: canDownloadMaskedCopy(file),
@@ -414,6 +542,7 @@ function redactCase(caseObj, { includeMessages = false, includeNotes = false } =
     encrypted: file.encrypted
   }));
   if (!includeNotes) delete next.notes;
+  delete next.processingPending;
   if (!includeMessages) delete next.messages;
   else next.messages = messagesForCase(caseObj);
   return next;
@@ -438,13 +567,43 @@ function publicReporterCase(caseObj){
       sanitizedHash: file.sanitizedHash,
       metadataSanitized: file.metadataSanitized,
       metadataRemoved: file.metadataRemoved,
-      processingStatus: canDownloadMaskedCopy(file) ? file.processingStatus : file.mime === 'application/pdf' ? 'QUARANTINED' : 'NEEDS_MASKING',
+      processingStatus: evidenceStatus(file),
+      maskedCopyAvailable: canDownloadMaskedCopy(file),
       encrypted: file.encrypted
     })),
     messages: next.messages,
     timeline: (next.timeline || []).map(item => ({ at: item.at, label: item.label })),
     threat: next.threat,
-    demonstration: next.demonstration || false
+    demonstration: next.demonstration || false,
+    reviewLocked: Boolean(next.reviewLocked), keyVersion: next.keyVersion || 0,
+    locationProtected: Boolean(next.locationEnvelope)
+  };
+}
+
+function reportReceipt(res, caseObj, recoverySecret) {
+  return sendJson(res, {
+    ok: true, id: caseObj.id, reporterId: caseObj.reporterId, recoverySecret,
+    files: caseObj.files.map(({ processingJob, ...file }) => file),
+    description: caseObj.description, category: caseObj.category, priority: caseObj.priority,
+    threat: caseObj.threat, submittedAt: caseObj.createdAt, security: caseObj.security,
+    processingPending: caseObj.files.some(jobPending),
+    signedReceipt: reporterSecurity.signedReceipt({ caseId: caseObj.id, submittedAt: caseObj.createdAt, evidence: caseObj.files.map(file => ({ sha3_256: file.originalHash, bytes: file.size })), keyVersion: caseObj.keyVersion || 0 }, getStorageKey()),
+    message: caseObj.files.some(jobPending) ? 'Report received. Evidence masking continues securely in the background. Save your Case ID and recovery key; you can leave this page.' : 'Report received. Save your Case ID and recovery key.',
+    warning: 'Store your high-entropy recovery key safely. SentinelQ cannot recover it if lost.',
+  });
+}
+
+function submissionIdentity(req, body) {
+  const token = req.headers['x-submission-token'];
+  if (!token) return null;
+  if (typeof token !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(token)) throw new EvidenceValidationError('INVALID_SUBMISSION_TOKEN', 'Invalid submission token. Reload before submitting.');
+  const derive = label => crypto.createHmac('sha256', getStorageKey()).update(`submission-v2:${label}:${token}`).digest();
+  return {
+    id: `CASE-V3-${derive('case').subarray(0, 16).toString('hex').toUpperCase()}`,
+    // Preserve receipts for a submission whose response was lost before upgrade.
+    legacyId: `CASE-V2-${derive('case').subarray(0, 16).toString('hex').toUpperCase()}`,
+    recoverySecret: derive('recovery').subarray(0, 20).toString('base64url'),
+    hash: crypto.createHmac('sha256', derive('payload')).update(canonical(body)).digest('hex'),
   };
 }
 
@@ -452,10 +611,34 @@ function requestFailure(res, error) {
   if (!res.headersSent && !res.writableEnded) sendJson(res, { ok: false, error: error?.status === 409 ? 'Record changed; reload and try again' : 'Secure storage unavailable. Please try again.' }, error?.status === 409 ? 409 : 503);
   else if (!res.writableEnded) res.end();
 }
-const server = http.createServer((req, res) => { handleRequest(req, res).catch(error => requestFailure(res, error)); });
+const server = http.createServer((req, res) => {
+  const pathname = req.url.split('?')[0];
+  let lockId;
+  try { lockId = pathname.startsWith('/cases/') ? decodeURIComponent(pathname.split('/')[2]) : pathname.startsWith('/evidence-link/') ? evidenceLinks.get(decodeURIComponent(pathname.split('/')[2]))?.caseId : pathname === '/report-base64' ? 'report-intake' : null; } catch {}
+  const action = () => handleRequest(req, res);
+  (lockId ? withCaseLock(lockId, action) : action()).catch(error => requestFailure(res, error));
+});
+function revokeCaseGrants(id) {
+  for (const [token, grant] of originalGrants) if (grant.caseId === id) { grant.dataKey?.fill(0); originalGrants.delete(token); }
+  for (const [token, grant] of evidenceLinks) if (grant.caseId === id) evidenceLinks.delete(token);
+  for (const [token, challenge] of viewerChallenges) if (challenge.caseId === id) viewerChallenges.delete(token);
+}
+async function verifiedAuditLines() {
+  const lines = await vault.readLog('audit');
+  if (!verifySignedLines(lines)) throw new Error('Audit integrity check failed');
+  return lines;
+}
+const reporterControls = createReporterControls({
+  vault, masterKey: getStorageKey, loadCase: loadCaseById, saveCase, caseKey: caseDataKey,
+  encrypt: encryptBuffer, decrypt: decryptBuffer, hash: computeHash, ledgerHash: findLedgerHash, appendLedger,
+  audit: auditEvent, revoke: revokeCaseGrants, auditLines: verifiedAuditLines,
+  verifyRecovery: (record, secret) => new Promise(resolve => verifyRecoverySecret(record, secret, resolve)),
+  recoveryHash: hashRecoverySecret, timeline: appendTimeline,
+});
 async function handleRequest(req, res) {
   req.res = res;
   const pathname = req.url.split('?')[0];
+  if (safeDecode(pathname, res) === null) return;
 
   // Render probes readiness over its internal HTTP connection. This endpoint
   // reveals no configuration and exists only after startup checks have passed.
@@ -474,9 +657,20 @@ async function handleRequest(req, res) {
 
   if (rateLimited(req, res)) return;
 
+  // Authentication precedes lookup, including nonexistent case IDs. Reporter
+  // follow-ups authenticate inside their bounded JSON handler.
+  if (pathname.startsWith('/cases/') && !(req.method === 'POST' && /^\/cases\/[^/]+\/messages$/.test(pathname))) {
+    if (!requirePermission(req, res, 'cases:read')) return;
+  }
+
   if (req.method === 'POST' && pathname === '/auth/login') {
-    readJson(req, async (obj, error) => {
+    return readJson(req, async (obj, error) => {
       if (error) return sendJson(res, { ok: false, error: 'invalid json' }, 400);
+      if (typeof obj.username !== 'string' || obj.username.length > 64 || typeof obj.password !== 'string' || obj.password.length > 256) return sendJson(res, { ok: false, error: 'invalid credentials' }, 401);
+      if (!loginAttemptAllowed(obj.username)) {
+        res.setHeader('Retry-After', '900');
+        return sendJson(res, { ok: false, error: 'Too many sign-in attempts. Try again in 15 minutes.' }, 429);
+      }
       const user = AUTHORITY_USERS.find(item => item.username === obj.username);
       const verifier = user?.passwordHash || AUTHORITY_USERS[0].passwordHash;
       const valid = await new Promise(resolve => verifyPassword(obj.password || '', verifier, resolve));
@@ -488,9 +682,11 @@ async function handleRequest(req, res) {
         const token = crypto.randomBytes(32).toString('base64url');
         const now = Date.now();
         pruneSessions();
-        sessions.set(token, { username: user.username, role: user.role, createdAt: now, lastSeenAt: now });
-        await auditEvent('LOGIN', sessions.get(token));
-        return sendJson(res, { ok: true, token, user: { username: user.username, role: user.role } });
+        const session = { username: user.username, role: user.role, createdAt: now, lastSeenAt: now };
+        await auditEvent('LOGIN', session);
+        sessions.set(token, session);
+        loginAttempts.delete(crypto.createHash('sha256').update(obj.username.toLowerCase()).digest('hex'));
+        return sendJson(res, { ok: true, token, user: { username: user.username, role: user.role }, idleTimeoutSeconds: SESSION_IDLE_MS / 1000, expiresAt: new Date(now + SESSION_ABSOLUTE_MS).toISOString() });
       }
     });
     return;
@@ -498,11 +694,9 @@ async function handleRequest(req, res) {
 
   if (req.method === 'POST' && pathname === '/auth/logout') {
     const session = getSession(req);
-    if (session) await auditEvent('LOGOUT', session);
     const token = (req.headers.authorization || '').replace(/^Bearer\s+/, '');
-    sessions.delete(token);
-    for (const [id, entry] of viewerChallenges) if (entry.session === session) viewerChallenges.delete(id);
-    for (const [id, grant] of originalGrants) if (grant.session === session) { grant.dataKey?.fill(0); originalGrants.delete(id); }
+    revokeSession(token);
+    if (session) await auditEvent('LOGOUT', session);
     return sendJson(res, { ok: true });
   }
 
@@ -510,14 +704,16 @@ async function handleRequest(req, res) {
     return sendJson(res, {
       status: 'ok',
       product: 'SentinelQ',
+      version: '2.0.0',
       mode: vault.provider === 'supabase' ? 'cloud-backed-prototype' : 'local-prototype',
       storage: vault.provider,
-      pqc: 'not-implemented',
+      pqc: 'implemented',
+      cryptography: postQuantum.algorithms,
       ledger: 'signed-local-hash-chain'
     });
   }
 
-  if (req.method === 'GET' && pathname === '/evidence-intake') return sendJson(res, { ok: true, ready: true });
+  if (req.method === 'GET' && pathname === '/evidence-intake') return sendJson(res, { ok: true, ready: true, evidenceRequired: true });
 
   if (req.method === 'GET' && pathname === '/viewer-key') {
     const session = requirePermission(req, res, 'evidence:original');
@@ -527,13 +723,14 @@ async function handleRequest(req, res) {
   if (req.method === 'POST' && pathname === '/viewer-key') {
     const session = requirePermission(req, res, 'evidence:original');
     if (!session) return;
-    readJson(req, async (obj, error) => {
+    return readJson(req, async (obj, error) => {
       if (error || typeof obj.password !== 'string' || obj.password.length > 256) return sendJson(res, { ok: false, error: 'Your account password is required' }, 400);
       const user = AUTHORITY_USERS.find(user => user.username === session.username);
       if (!user || !await new Promise(resolve => verifyPassword(obj.password, user.passwordHash, resolve))) return sendJson(res, { ok: false, error: 'Account password incorrect' }, 403);
       if (await vault.getViewerKey(session.username)) return sendJson(res, { ok: false, error: 'Your personal access key is already configured. Use your saved key.' }, 409);
       const key = crypto.randomBytes(32).toString('base64url');
-      const hash = hashPassword(key);
+      const hash = await hashPasswordAsync(key);
+      if (!sessionActive(session)) return sendJson(res, { ok: false, error: 'Session expired' }, 401);
       await auditEvent('VIEWER_KEY_CREATED', session);
       if (await vault.registerViewerKey(session.username, hash) !== hash) return sendJson(res, { ok: false, error: 'Your personal access key is already configured.' }, 409);
       return sendJson(res, { ok: true, key, warning: 'Save this personal access key securely. It is shown once and cannot be recovered.' });
@@ -543,11 +740,13 @@ async function handleRequest(req, res) {
   if (req.method === 'POST' && pathname === '/courts') {
     const session = requirePermission(req, res, 'courts:create');
     if (!session) return;
-    readJson(req, async (obj, error) => {
+    return readJson(req, async (obj, error) => {
+      if (error) return sendJson(res, { ok: false, error: 'invalid json' }, 400);
       const username = typeof obj.username === 'string' ? obj.username.trim().toLowerCase() : '';
       if (error || !/^[a-z][a-z0-9_-]{2,63}$/.test(username) || typeof obj.password !== 'string' || obj.password.length < 16 || obj.password.length > 256) return sendJson(res, { ok: false, error: 'Use a unique username (3–64 lowercase letters, digits, _ or -) and password of 16–256 characters.' }, 400);
       if (AUTHORITY_USERS.some(user => user.username === username)) return sendJson(res, { ok: false, error: 'Username already exists' }, 409);
-      const user = { username, role: 'COURT', passwordHash: hashPassword(obj.password) };
+      const user = { username, role: 'COURT', passwordHash: await hashPasswordAsync(obj.password) };
+      if (!sessionActive(session)) return sendJson(res, { ok: false, error: 'Session expired' }, 401);
       await auditEvent('COURT_ACCOUNT_CREATED', session, null, { courtUsername: username });
       try { await vault.createCourtAccount(user); }
       catch (failure) { return sendJson(res, { ok: false, error: 'Court account could not be created. The username may already exist.' }, 409); }
@@ -574,30 +773,58 @@ async function handleRequest(req, res) {
   if (req.method === 'GET' && pathname === '/capabilities') {
     return sendJson(res, {
       ok: true,
-      implemented: ['pseudonymous-report', 'high-entropy-recovery-key', 'aes-256-gcm', 'sha3-256', 'image-metadata-strip', 'rbac', 'signed-audit-chain', 'signed-local-integrity-ledger', 'rule-based-privacy-advisory', 'full-frame-blur', 'voice-alteration', 'viewer-key-original-access', 'viewer-photo-audit', 'court-accounts'],
+      implemented: ['pseudonymous-report', 'high-entropy-recovery-key', 'aes-256-gcm', 'ml-kem', 'ml-dsa', 'sha3-256', 'image-metadata-strip', 'rbac', 'signed-audit-chain', 'signed-local-integrity-ledger', 'rule-based-privacy-advisory', 'full-frame-blur', 'voice-alteration', 'viewer-key-original-access', 'viewer-photo-audit', 'court-accounts', 'mandatory-evidence', 'private-duplicate-rejection', 'judicial-location-encryption', 'reporter-access-alerts', 'emergency-deletion', 'case-key-rotation', 'signed-reporter-receipts'],
+      cryptography: postQuantum.algorithms,
       prototype: ['one-time-evidence-link', 'coarse-aggregate-counts'],
-      notImplemented: ['network-anonymity', 'ml-kem', 'ml-dsa', 'zkp', 'hyperledger', 'selective-face-detection', 'guaranteed-speaker-anonymization', 'spoken-identifier-redaction', 'dead-man-release', 'malware-scanner']
+      notImplemented: ['network-anonymity', 'post-quantum-tls', 'end-to-end-encryption', 'zkp', 'hyperledger', 'selective-face-detection', 'guaranteed-speaker-anonymization', 'spoken-identifier-redaction', 'dead-man-release', 'malware-scanner']
     });
   }
 
   if (req.method === 'POST' && pathname === '/track') {
-    readJson(req, async (obj, error) => {
+    return readJson(req, async (obj, error) => {
       if (error) return sendJson(res, { ok: false, error: 'invalid json' }, 400);
       const caseObj = await loadCaseById(obj.caseId || '');
       const valid = await new Promise(resolve => verifyRecoverySecret(caseObj, obj.recoverySecret || '', resolve));
       {
         if (!valid) return sendJson(res, { ok: false, error: 'case access credentials did not match' }, 401);
         await auditEvent('REPORTER_TRACK', { username: 'reporter', role: 'REPORTER' }, caseObj.id);
-        return sendJson(res, { ok: true, case: publicReporterCase(caseObj) });
+        return sendJson(res, { ok: true, case: { ...publicReporterCase(caseObj), accessAlerts: await reporterControls.alerts(caseObj) } });
       }
     });
     return;
   }
 
+  if (req.method === 'POST' && ['/track/emergency', '/track/alerts', '/track/alerts/ack', '/track/resume'].includes(pathname)) {
+    return readJson(req, async (obj, error) => {
+      if (error || !validCaseId(obj?.caseId)) return sendJson(res, { ok: false, error: 'invalid case request' }, 400);
+      if (pathname === '/track/emergency') {
+        const result = await reporterControls.emergency(obj);
+        evidenceWorker.wake();
+        return sendJson(res, result.body, result.status);
+      }
+      const record = await loadCaseById(obj.caseId);
+      if (!await new Promise(resolve => verifyRecoverySecret(record, obj.recoverySecret, resolve))) return sendJson(res, { ok: false, error: 'case access credentials did not match' }, 401);
+      if (pathname === '/track/resume') {
+        record.reviewLocked = false;
+        appendTimeline(record, 'Authority review resumed', 'Reporter allowed authority review with the replacement key.');
+        await auditEvent('REPORTER_REVIEW_RESUMED', { username: 'reporter', role: 'REPORTER' }, record.id);
+        await saveCase(record);
+      }
+      let alerts = await reporterControls.alerts(record, obj.before);
+      if (pathname === '/track/alerts/ack') {
+        if (!Number.isSafeInteger(obj.through) || obj.through < 0 || obj.through > alerts.total) return sendJson(res, { ok: false, error: 'Invalid alert cursor' }, 400);
+        record.alertsSeenThrough = Math.max(record.alertsSeenThrough || 0, obj.through);
+        await saveCase(record);
+        alerts = await reporterControls.alerts(record);
+      }
+      return sendJson(res, { ok: true, case: { ...publicReporterCase(record), accessAlerts: alerts } });
+    }, 4096);
+  }
+
   if (req.method === 'GET' && pathname === '/analytics'){
     const session = requirePermission(req, res, 'cases:read');
     if (!session) return;
-    const cases = (await loadCases()).filter(item => session.role !== 'INVESTIGATOR' || (item.assignedTo || []).includes(session.username));
+    const cases = (await loadCases()).filter(item => !item.reviewLocked && (session.role !== 'INVESTIGATOR' || (item.assignedTo || []).includes(session.username)));
     const byCategory = {};
     const byPriority = {};
     const byRegion = {};
@@ -616,13 +843,28 @@ async function handleRequest(req, res) {
     });
   }
 
+  if (req.method === 'GET' && pathname === '/authorities/investigators') {
+    const session = requirePermission(req, res, 'assign:write');
+    if (!session) return;
+    return sendJson(res, { ok: true, investigators: AUTHORITY_USERS
+      .filter(user => user.role === 'INVESTIGATOR')
+      .map(user => ({ username: user.username }))
+      .sort((left, right) => left.username.localeCompare(right.username)) });
+  }
+
   if (req.method === 'GET' && pathname === '/cases'){
     const session = requirePermission(req, res, 'cases:read');
     if (!session) return;
     try{
-      const cases = (await loadCases())
-        .filter(item => session.role !== 'INVESTIGATOR' || (item.assignedTo || []).includes(session.username))
-        .map(item => redactCase(item, { includeNotes: ROLE_PERMISSIONS[session.role]?.includes('notes:read') }));
+      const candidates = (await loadCases()).filter(item => !item.reviewLocked && (session.role !== 'INVESTIGATOR' || (item.assignedTo || []).includes(session.username)));
+      const cases = [];
+      for (const item of candidates) await withCaseLock(item.id, async () => {
+        const current = await loadCaseById(item.id);
+        if (!current || current.reviewLocked || (session.role === 'INVESTIGATOR' && !current.assignedTo.includes(session.username))) return;
+        cases.push(redactCase(current, { includeNotes: ROLE_PERMISSIONS[session.role]?.includes('notes:read') }));
+      });
+      // Nothing is released unless every listed case's view was audited.
+      await auditEvents('CASE_LIST_VIEW', session, cases.map(item => item.id));
       return sendJson(res, { ok: true, cases });
     }catch(e){
       return sendJson(res, { ok: false, error: 'could not load cases' }, 500);
@@ -663,89 +905,104 @@ async function handleRequest(req, res) {
   }
 
   if (req.method === 'POST' && req.url === '/report'){
-    readJson(req, async (obj, error) => {
-      if (error) return sendJson(res, { ok: false, error: 'invalid json' }, 400);
-      try {
-        const { title = '', description = '' } = obj;
-        if (!String(title).trim() || !String(description).trim() || String(title).length > 200 || String(description).length > 10000) {
-          return sendJson(res, { ok: false, error: 'invalid report fields' }, 400);
-        }
-        const id = generateCaseId();
-        const recoverySecret = generateRecoveryPhrase();
-        const reporterId = generateReporterId();
-        const caseObj = { id, reporterId, title, description, createdAt: new Date().toISOString(), recoveryHash: hashRecoverySecret(id, recoverySecret), status: 'Open', priority: inferPriority(categorizeText(description)), category: categorizeText(description), files: [], timeline: [] };
-        appendTimeline(caseObj, 'Complaint received', 'Pseudonymous report stored.');
-        await saveCase(caseObj);
-        return sendJson(res, { ok: true, id, reporterId, recoverySecret });
-      } catch (processingError) {
-        return sendJson(res, { ok: false, error: 'report could not be stored' }, 500);
-      }
-    }, 16 * 1024);
-    return;
+    req.resume();
+    return sendJson(res, { ok: false, error: 'At least one supporting evidence file is required. Submit through /report-base64.', code: 'EVIDENCE_REQUIRED' }, 400);
   }
 
   if (req.method === 'POST' && req.url === '/report-base64'){
-    readJson(req, async (obj, error) => {
-      if (error) return sendJson(res, { ok: false, error: 'invalid json' }, 400);
+    if (activeReports >= 3) { res.setHeader('Retry-After', '10'); return sendJson(res, { ok: false, error: 'The secure upload service is busy. Please retry shortly.' }, 503); }
+    activeReports++;
+    let released = false;
+    let storing = false;
+    const release = () => { if (!released) { activeReports--; released = true; } };
+    res.once('finish', release);
+    res.once('close', () => { if (!storing) release(); });
+    return readJson(req, async (obj, error) => {
+      if (error) { release(); return sendJson(res, { ok: false, error: 'invalid json' }, 400); }
+      storing = true;
       const createdArtifactPaths = [];
       let caseSaved = false;
+      let commitAttempted = false;
+      let submission;
+      let dataKey;
       try {
-        const { title = '', description = '', anonymizedDescription = '', files = [], regionBucket = '', deadManDays = 0, involved = '', incidentDate = '' } = obj;
-        if (!String(title).trim() || !String(description).trim() || !Array.isArray(files) || files.length > 5 || String(title).length > 200 || String(description).length > 10000 || String(anonymizedDescription).length > 10000) return sendJson(res, { ok: false, error: 'invalid report fields' }, 400);
+        const { title = '', description = '', anonymizedDescription = '', files = [], regionBucket = '', deadManDays = 0, involved = '', incidentDate = '', location = '' } = obj;
+        if (typeof title !== 'string' || typeof description !== 'string' || typeof anonymizedDescription !== 'string' || typeof involved !== 'string' || typeof incidentDate !== 'string' || typeof regionBucket !== 'string' || !title.trim() || !description.trim() || !Array.isArray(files) || files.length > 5 || title.length > 200 || description.length > 10000 || anonymizedDescription.length > 10000 || involved.length > 400 || incidentDate.length > 40 || regionBucket.length > 80) return sendJson(res, { ok: false, error: 'invalid report fields' }, 400);
         if (Number(deadManDays) > 0) return sendJson(res, { ok: false, error: 'dead-man release is not implemented and cannot be enabled' }, 400);
+        if (typeof location !== 'string' || location.length > 500) return sendJson(res, { ok: false, error: 'Location must be text of up to 500 characters.' }, 400);
         const safeDescription = (anonymizedDescription || description || '').trim() || description;
-        const id = generateCaseId();
+        submission = submissionIdentity(req, obj);
+        if (submission) {
+          const priorRow = await reporterControls.rawCase(submission.id) || await reporterControls.rawCase(submission.legacyId);
+          if (priorRow?.payload.deleted || priorRow?.payload.emergencyOperation) return sendJson(res, { ok: false, error: 'This submission receipt was retired by an emergency action. Use your saved case credentials.' }, 409);
+          const previous = priorRow ? await loadCaseById(priorRow.payload.id) : null;
+          if (previous) {
+            if (previous.submissionHash !== submission.hash) return sendJson(res, { ok: false, error: 'This submission token was already used for different report contents.' }, 409);
+            return reportReceipt(res, previous, submission.recoverySecret);
+          }
+        }
+        if (!files.length) throw new EvidenceValidationError('EVIDENCE_REQUIRED', 'Attach at least one nonempty supporting evidence file before submitting.');
+        const fingerprint = reporterSecurity.complaintFingerprint({ description, incidentDate }, getStorageKey());
+        const registered = await vault.listCases();
+        if (registered.some(row => {
+          verifyCase(row.payload, getStorageKey());
+          return (row.payload.complaintFingerprint || (!row.payload.deleted && reporterSecurity.complaintFingerprint(hydrateCase(row), getStorageKey()))) === fingerprint;
+        })) {
+          return sendJson(res, { ok: false, code: 'DUPLICATE_COMPLAINT', error: 'A complaint with the same normalized narrative and incident date is already registered. Use your saved Case ID to follow up, or describe the distinct incident.' }, 409);
+        }
+        if (location.trim()) {
+          try { requireSecret('SENTINELQ_JUDICIAL_ACCESS_KEY', 32); }
+          catch { return sendJson(res, { ok: false, code: 'LOCATION_KEY_UNAVAILABLE', error: 'Encrypted location storage is not configured. Ask the operator to configure the judicial key, or omit the optional location.' }, 503); }
+        }
+        const id = submission?.id || generateCaseId();
+        dataKey = crypto.randomBytes(32);
+        const keyEnvelope = reporterSecurity.wrapCaseKey(id, dataKey, getStorageKey());
+        const locationEnvelope = location.trim() ? reporterSecurity.sealLocation(location.trim(), id, requireSecret('SENTINELQ_JUDICIAL_ACCESS_KEY', 32)) : null;
         const reporterId = generateReporterId();
-        const recoverySecret = generateRecoveryPhrase();
+        const recoverySecret = submission?.recoverySecret || generateRecoveryPhrase();
         const category = categorizeText(`${title} ${safeDescription}`);
         const warnings = checkPrivacy(`${title} ${description}`);
         const savedFiles = [];
+        const validatedFiles = [];
+        let totalBytes = 0;
+        // Validate the entire batch before writing anything to the vault.
         for (const f of files){
           if (!f || typeof f !== 'object') throw new EvidenceValidationError('INVALID_EVIDENCE_ENCODING', 'An attachment was not transferred correctly. Please attach it again.');
           const { name = 'file.bin', data: b64 = '' } = f;
+          if (typeof name !== 'string' || name.length > 180 || /[\x00-\x1f\x7f\\/]/.test(name)) throw new EvidenceValidationError('INVALID_EVIDENCE_FORMAT', 'Use a filename of up to 180 characters without paths or control characters.');
           if (typeof b64 !== 'string' || b64.length === 0 || b64.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(b64)) throw new EvidenceValidationError('INVALID_EVIDENCE_ENCODING', 'An attachment was not transferred correctly. Please attach it again. If it was recorded here, save your report details, reload the page, and record again.');
           const buf = Buffer.from(b64, 'base64');
           if (buf.toString('base64') !== b64) throw new EvidenceValidationError('INVALID_EVIDENCE_ENCODING', 'An attachment was not transferred correctly. Please attach it again.');
           if (!buf.length || buf.length > MAX_FILE_BYTES) throw new EvidenceValidationError('EVIDENCE_SIZE_LIMIT', 'Each evidence file must contain data and be no larger than 8 MiB.', 413);
+          totalBytes += buf.length;
+          if (totalBytes > MAX_FILE_BYTES) throw new EvidenceValidationError('EVIDENCE_SIZE_LIMIT', 'Evidence attachments must total no more than 8 MiB.', 413);
           const mimeCheck = inspectUpload(name, buf);
           if (!mimeCheck.ok) throw new EvidenceValidationError('INVALID_EVIDENCE_FORMAT', mimeCheck.error === 'unsupported file type' ? 'Unsupported attachment type. Use JPEG, PNG, MP4, WebM, WAV, MP3, M4A, OGG, PDF or TXT.' : 'An attachment does not match its file format or is damaged. Please attach the original file or record again.');
+          validatedFiles.push({ name, buf });
+        }
+        for (const { name, buf } of validatedFiles) {
           const originalHash = computeHash(buf);
-          let outBuf = buf;
-          let metadataRemoved = false;
-          let metadataSanitized = false;
           const mime = mimeForName(name);
           const isVideo = mime.startsWith('video/');
           const isAudio = mime.startsWith('audio/');
           const isImage = mime.startsWith('image/');
           const isText = mime === 'text/plain';
           const isPdf = mime === 'application/pdf';
-          try{
-            if (/\.jpe?g$/i.test(name)) { outBuf = stripJpegExif(buf); metadataSanitized = true; }
-            else if (/\.png$/i.test(name)) { outBuf = stripPngTextChunks(buf); metadataSanitized = true; }
-            metadataRemoved = metadataSanitized && outBuf.length !== buf.length;
-          }catch(e){
-            throw new EvidenceValidationError('INVALID_EVIDENCE_FORMAT', 'An image could not be read safely. Please attach the original image or take another photo.');
-          }
           const safeName = `${id}-${crypto.randomUUID()}`;
           const originalName = `${safeName}.original`;
           const sanitizedName = `${safeName}.sanitized`;
-          await vault.writeArtifact(originalName, encryptBuffer(buf, `evidence:${id}:${originalName}`));
+          await vault.writeArtifact(originalName, encryptBuffer(buf, `evidence:${id}:${originalName}`, dataKey));
           createdArtifactPaths.push(originalName);
-          let privacyResult = null;
-          if (isImage || isVideo || isAudio) privacyResult = await processMediaPrivacy(buf, isVideo ? 'video' : isAudio ? 'audio' : 'image');
-          else if (isText) privacyResult = { status: 'COMPLETE', buffer: maskTextEvidence(buf), error: null, transformations: ['TEXT_CONTENT_MASKED'] };
-          if (privacyResult?.status === 'COMPLETE') {
-            outBuf = privacyResult.buffer;
-            if (isImage) { metadataSanitized = true; metadataRemoved = true; }
-          }
+          // Media processing is durable background work. Plain text masking is
+          // bounded and cheap; keep its existing immediate review copy.
+          const privacyResult = isText ? { status: 'COMPLETE', buffer: maskTextEvidence(buf), error: null, transformations: ['TEXT_CONTENT_MASKED'] } : null;
           const hasDerivative = privacyResult?.status === 'COMPLETE';
           if (hasDerivative) {
-            await vault.writeArtifact(sanitizedName, encryptBuffer(outBuf, `evidence:${id}:${sanitizedName}`));
+            await vault.writeArtifact(sanitizedName, encryptBuffer(privacyResult.buffer, `evidence:${id}:${sanitizedName}`, dataKey));
             createdArtifactPaths.push(sanitizedName);
           }
-          const sanitizedHash = hasDerivative ? computeHash(outBuf) : null;
-          const processingStatus = isPdf ? 'QUARANTINED' : privacyResult.status;
-          const duplicateCaseCount = await countDuplicateEvidence(originalHash, id);
+          const sanitizedHash = hasDerivative ? computeHash(privacyResult.buffer) : null;
+          const processingStatus = isPdf ? 'QUARANTINED' : hasDerivative ? 'COMPLETE' : 'QUEUED';
           savedFiles.push({
             name: sanitizedName,
             original: name,
@@ -757,16 +1014,17 @@ async function handleRequest(req, res) {
             sanitizedHash,
             hash: sanitizedHash,
             encrypted: true,
-            metadataRemoved,
-            metadataSanitized,
+            metadataRemoved: false,
+            metadataSanitized: false,
             processingStatus,
-            processingError: isPdf ? 'PDF requires a reviewed redaction process before release.' : privacyResult.error,
-            transformations: isPdf ? [] : privacyResult.transformations,
+            processingError: isPdf ? 'PDF requires a reviewed redaction process before release.' : null,
+            transformations: privacyResult?.transformations || [],
+            ...(processingStatus === 'QUEUED' ? { processingJob: { version: 2, attempts: 0, nextAttemptAt: Date.now() } } : {}),
             derivativeMime: isVideo ? 'video/mp4' : isAudio ? 'audio/wav' : isImage ? 'image/png' : mime,
             privacyVersion: hasDerivative ? PRIVACY_DERIVATIVE_VERSION : null,
-            duplicateCaseCount,
             mimeNotes: []
           });
+          buf.fill(0);
         }
         const threat = scoreThreat(warnings, savedFiles);
         const caseObj = {
@@ -780,6 +1038,9 @@ async function handleRequest(req, res) {
           files: savedFiles,
           createdAt: new Date().toISOString(),
           recoveryHash: hashRecoverySecret(id, recoverySecret),
+          submissionHash: submission?.hash || null,
+          keyEnvelope, keyVersion: 1, locationEnvelope, complaintFingerprint: fingerprint,
+          reviewLocked: false, alertsSeenThrough: 0,
           category,
           status: 'Open',
           priority: inferPriority(category),
@@ -791,29 +1052,34 @@ async function handleRequest(req, res) {
           threat,
           privacyWarnings: warnings,
           deadManSwitch: { enabled: false, intervalDays: 0, lastCheckIn: null, releaseState: 'off' },
-          security: { encrypted: true, metadataSanitized: savedFiles.some(file => file.metadataSanitized), metadataRemoved: savedFiles.some(file => file.metadataRemoved), ledgered: savedFiles.some(file => file.sanitizedHash), algorithm: 'aes-256-gcm', integrity: 'sha3-256', pqc: 'not-implemented', ledger: 'signed-local-hash-chain' }
+          security: { encrypted: true, metadataSanitized: savedFiles.some(file => file.metadataSanitized), metadataRemoved: savedFiles.some(file => file.metadataRemoved), ledgered: savedFiles.some(file => file.sanitizedHash), algorithm: 'ml-kem-768+hkdf-sha512+aes-256-gcm', integrity: 'sha3-256', caseSignature: 'ml-dsa-65', pqc: 'implemented', ledger: 'signed-local-hash-chain' }
         };
         appendTimeline(caseObj, 'Complaint received', 'Pseudonymous report stored with a recovery key.');
         if (savedFiles.length) appendTimeline(caseObj, 'Evidence stored', `${savedFiles.length} file(s) hashed and encrypted at rest.`);
-        for (const file of savedFiles) if (file.sanitizedHash) await appendLedger(id, file.name, file.sanitizedHash);
+        if (savedFiles.some(jobPending)) appendTimeline(caseObj, 'Evidence masking queued', 'Your report is received immediately; media masking continues in the background. Originals remain restricted.');
+        for (const file of savedFiles) {
+          await appendLedger(id, file.originalArtifact, file.originalHash);
+          if (file.sanitizedHash) await appendLedger(id, file.name, file.sanitizedHash);
+        }
+        await auditEvent('REPORT_INTAKE', null, id, { evidenceCount: savedFiles.length });
+        commitAttempted = true;
         await saveCase(caseObj);
         caseSaved = true;
-        return sendJson(res, {
-          ok: true,
-          id,
-          reporterId,
-          recoverySecret,
-          files: savedFiles,
-          description: safeDescription,
-          category,
-          priority: caseObj.priority,
-          threat,
-          submittedAt: caseObj.createdAt,
-          security: caseObj.security,
-          warning: 'Store your high-entropy recovery key safely. SentinelQ cannot recover it if lost.'
-        });
+        // The response is committed before waking the worker. Periodic scans
+        // recover this work even if the process dies before wake().
+        res.once('finish', () => evidenceWorker.wake());
+        return reportReceipt(res, caseObj, recoverySecret);
       } catch (processingError) {
-        if (!caseSaved) {
+        if (submission && commitAttempted && processingError.status === 409) {
+          const previous = await loadCaseById(submission.id);
+          if (previous?.submissionHash === submission.hash) {
+            for (const artifact of createdArtifactPaths) await vault.removeArtifact(artifact).catch(() => {});
+            return reportReceipt(res, previous, submission.recoverySecret);
+          }
+        }
+        // A cloud timeout can mean the case was committed but its response was
+        // lost. Never delete its evidence on an ambiguous commit outcome.
+        if (!caseSaved && !commitAttempted) {
           for (const artifactPath of createdArtifactPaths) {
             try { await vault.removeArtifact(artifactPath); } catch (cleanupError) {}
           }
@@ -824,16 +1090,16 @@ async function handleRequest(req, res) {
         // Do not log report contents, filenames, media bytes or credentials.
         console.error(JSON.stringify({ event: 'REPORT_SUBMISSION_FAILED', reference, kind: storageFailure ? 'storage' : 'internal' }));
         return sendJson(res, { ok: false, error: `${storageFailure ? 'Secure storage unavailable.' : 'The report could not be saved because of a server error.'} Please try again. Reference: ${reference}`, code: storageFailure ? 'STORAGE_UNAVAILABLE' : 'REPORT_SAVE_FAILED', reference }, storageFailure ? processingError.status : 500);
-      }
+      } finally { if (dataKey) { postQuantum.forgetEncryptionKey(dataKey); dataKey.fill(0); } release(); }
     }, MAX_REQUEST_BYTES);
     return;
   }
 
   if (req.method === 'POST' && pathname === '/anonymize'){
-    readJson(req, async (obj, error) => {
+    return readJson(req, async (obj, error) => {
       if (error) return sendJson(res, { ok: false, error: 'invalid json' }, 400);
         const { text = '' } = obj;
-        if (String(text).length > 10000) return sendJson(res, { ok: false, error: 'text too long' }, 400);
+        if (typeof text !== 'string' || text.length > 10000) return sendJson(res, { ok: false, error: 'text must be a string of up to 10000 characters' }, 400);
         const hits = privacyHits(text);
         const anonymizedText = anonymizeText(text);
         return sendJson(res, { ok: true, anonymizedText, warnings: checkPrivacy(text), hits, engine: 'rule-based', note: 'Advisory pattern matching only; manual review is still required.' });
@@ -842,10 +1108,10 @@ async function handleRequest(req, res) {
   }
 
   if (req.method === 'POST' && pathname === '/categorize'){
-    readJson(req, async (obj, error) => {
+    return readJson(req, async (obj, error) => {
       if (error) return sendJson(res, { ok: false, error: 'invalid json' }, 400);
         const { text = '' } = obj;
-        if (String(text).length > 10000) return sendJson(res, { ok: false, error: 'text too long' }, 400);
+        if (typeof text !== 'string' || text.length > 10000) return sendJson(res, { ok: false, error: 'text must be a string of up to 10000 characters' }, 400);
         const category = categorizeText(text);
         return sendJson(res, { ok: true, category, priority: inferPriority(category), engine: 'keyword-rules' });
     }, 16 * 1024);
@@ -853,10 +1119,10 @@ async function handleRequest(req, res) {
   }
 
   if (req.method === 'POST' && pathname === '/privacy-check'){
-    readJson(req, async (obj, error) => {
+    return readJson(req, async (obj, error) => {
       if (error) return sendJson(res, { ok: false, error: 'invalid json' }, 400);
         const { text = '' } = obj;
-        if (String(text).length > 10000) return sendJson(res, { ok: false, error: 'text too long' }, 400);
+        if (typeof text !== 'string' || text.length > 10000) return sendJson(res, { ok: false, error: 'text must be a string of up to 10000 characters' }, 400);
         const warnings = checkPrivacy(text);
         const hits = privacyHits(text);
         return sendJson(res, { ok: true, warnings, hits, threat: scoreThreat(warnings, []), suggestion: warnings.length ? 'Rephrase to avoid revealing personal or workplace details.' : 'No rule match was found; manual privacy review is still required.', engine: 'rule-based-advisory' });
@@ -867,10 +1133,10 @@ async function handleRequest(req, res) {
   if (req.method === 'POST' && pathname === '/ai/analyze'){
     const session = requirePermission(req, res, 'cases:read');
     if (!session) return;
-    readJson(req, async (obj, error) => {
+    return readJson(req, async (obj, error) => {
       if (error) return sendJson(res, { ok: false, error: 'invalid json' }, 400);
       const text = String(obj.text || '').slice(0, 10000);
-      if (!obj.allowExternalProcessing) return sendJson(res, { ok: true, analysis: localAiAnalysis(text), source: 'local-rules', available: false, note: 'External processing requires explicit per-request consent.' });
+      if (obj.allowExternalProcessing !== true) return sendJson(res, { ok: true, analysis: localAiAnalysis(text), source: 'local-rules', available: false, note: 'External processing requires explicit per-request consent.' });
       const local = localAiAnalysis(text);
       maybeRemoteAi(text).then(remote => {
         return sendJson(res, { ok: true, analysis: remote || local, source: remote ? 'external-model' : 'local-rules', available: Boolean(remote) });
@@ -883,7 +1149,7 @@ async function handleRequest(req, res) {
     const parts = pathname.split('/').filter(Boolean);
     const id = safeDecode(parts[1], res);
     if (id === null) return;
-    readJson(req, async (obj, error) => {
+    return readJson(req, async (obj, error) => {
       if (error) return sendJson(res, { ok: false, error: 'invalid json' }, 400);
         const { status = 'Open', priority = 'Medium' } = obj;
         if (!['Open', 'In Review', 'Closed'].includes(status) || !['Low', 'Medium', 'High'].includes(priority)) return sendJson(res, { ok: false, error: 'invalid status or priority' }, 400);
@@ -894,9 +1160,9 @@ async function handleRequest(req, res) {
         caseObj.status = status;
         caseObj.priority = priority;
         appendTimeline(caseObj, 'Status updated', `Status set to ${status} (${priority}).`);
-        await saveCase(caseObj);
         await auditEvent('CASE_STATUS_CHANGE', session, id);
-        return sendJson(res, { ok: true, case: redactCase(caseObj) });
+        await saveCase(caseObj);
+        return sendJson(res, { ok: true, case: redactCase(caseObj, { includeMessages: true, includeNotes: true }) });
     }, 4096);
     return;
   }
@@ -905,19 +1171,19 @@ async function handleRequest(req, res) {
     const parts = pathname.split('/').filter(Boolean);
     const id = safeDecode(parts[1], res);
     if (id === null) return;
-    readJson(req, async (obj, error) => {
+    return readJson(req, async (obj, error) => {
       if (error) return sendJson(res, { ok: false, error: 'invalid json' }, 400);
       const caseObj = await loadCaseById(id);
       if (!caseObj) return sendJson(res, { ok: false, error: 'not found' }, 404);
       const session = requirePermission(req, res, 'assign:write', caseObj);
       if (!session) return;
-      const username = String(obj.username || '').trim();
-      if (!AUTHORITY_USERS.some(user => user.username === username && user.role === 'INVESTIGATOR')) return sendJson(res, { ok: false, error: 'unknown investigator' }, 400);
-      caseObj.assignedTo = [username];
-      appendTimeline(caseObj, 'Investigator assigned', `Assigned to ${username}.`);
-      await saveCase(caseObj);
+      const username = typeof obj.username === 'string' ? obj.username.trim() : null;
+      if (obj.username !== null && (!username || !AUTHORITY_USERS.some(user => user.username === username && user.role === 'INVESTIGATOR'))) return sendJson(res, { ok: false, error: 'unknown investigator' }, 400);
+      caseObj.assignedTo = username ? [username] : [];
+      appendTimeline(caseObj, username ? 'Investigator assigned' : 'Investigator unassigned', username ? `Assigned to ${username}.` : 'The investigator assignment was cleared.');
       await auditEvent('CASE_ASSIGN', session, id);
-      return sendJson(res, { ok: true, case: redactCase(caseObj) });
+      await saveCase(caseObj);
+      return sendJson(res, { ok: true, case: redactCase(caseObj, { includeMessages: true, includeNotes: true }) });
     });
     return;
   }
@@ -926,18 +1192,19 @@ async function handleRequest(req, res) {
     const parts = pathname.split('/').filter(Boolean);
     const id = safeDecode(parts[1], res);
     if (id === null) return;
-    readJson(req, async (obj, error) => {
+    return readJson(req, async (obj, error) => {
       if (error) return sendJson(res, { ok: false, error: 'invalid json' }, 400);
       const caseObj = await loadCaseById(id);
       if (!caseObj) return sendJson(res, { ok: false, error: 'not found' }, 404);
       const session = requirePermission(req, res, 'notes:write', caseObj);
       if (!session) return;
+      if (typeof obj.text !== 'string' || !obj.text.trim() || obj.text.length > 4000) return sendJson(res, { ok: false, error: 'note must be 1-4000 characters' }, 400);
       const notes = Array.isArray(caseObj.notes) ? caseObj.notes : [];
-      notes.push({ id: `note-${Date.now()}`, author: session.username, role: session.role, text: String(obj.text || '').slice(0, 4000), createdAt: new Date().toISOString() });
+      notes.push({ id: `note-${crypto.randomUUID()}`, author: session.username, role: session.role, text: obj.text.trim(), createdAt: new Date().toISOString() });
       caseObj.notes = notes;
       appendTimeline(caseObj, 'Investigation note', 'An investigator added an internal note.');
-      await saveCase(caseObj);
       await auditEvent('CASE_NOTE', session, id);
+      await saveCase(caseObj);
       return sendJson(res, { ok: true, notes });
     });
     return;
@@ -947,24 +1214,25 @@ async function handleRequest(req, res) {
     const parts = pathname.split('/').filter(Boolean);
     const id = safeDecode(parts[1], res);
     if (id === null) return;
-    readJson(req, async (body, error) => {
+    return readJson(req, async (body, error) => {
         if (error) return sendJson(res, { ok: false, error: 'invalid json' }, 400);
         const { text = '', sender = 'authority', recoverySecret = '' } = body;
-        if (!String(text).trim() || String(text).length > 4000) return sendJson(res, { ok: false, error: 'message must be 1-4000 characters' }, 400);
+        if (typeof text !== 'string' || !text.trim() || text.length > 4000) return sendJson(res, { ok: false, error: 'message must be 1-4000 characters' }, 400);
         const caseObj = await loadCaseById(id);
         const session = getSession(req);
         const storeMessage = async actor => {
           const messages = Array.isArray(caseObj.messages) ? caseObj.messages : [];
           const messageId = `msg-${crypto.randomUUID()}`;
-          messages.push({ id: messageId, sender: actor.role === 'REPORTER' ? 'reporter' : 'authority', text: encryptMessage(text, id, messageId), createdAt: new Date().toISOString() });
+          messages.push({ id: messageId, sender: actor.role === 'REPORTER' ? 'reporter' : 'authority', text: encryptMessage(text, id, messageId, caseDataKey(caseObj)), createdAt: new Date().toISOString() });
           caseObj.messages = messages;
           appendTimeline(caseObj, 'Message sent', actor.role === 'REPORTER' ? 'Reporter sent a follow-up.' : 'Authority sent a follow-up.');
-          await saveCase(caseObj);
           await auditEvent('CHAT_ACCESS', actor, id);
+          await saveCase(caseObj);
           return sendJson(res, { ok: true, messages: await loadMessages(id) });
         };
         if (session && ROLE_PERMISSIONS[session.role]?.includes('chat:write')) {
           if (!caseObj) return sendJson(res, { ok: false, error: 'not found' }, 404);
+          if (!requirePermission(req, res, 'chat:write', caseObj)) return;
           if (session.role === 'INVESTIGATOR' && !((caseObj.assignedTo || []).includes(session.username))) {
             return sendJson(res, { ok: false, error: 'case access denied' }, 403);
           }
@@ -987,7 +1255,7 @@ async function handleRequest(req, res) {
     const parts = pathname.split('/').filter(Boolean);
     const id = safeDecode(parts[1], res);
     if (id === null) return;
-    readJson(req, async (obj, error) => {
+    return readJson(req, async (obj, error) => {
       if (error) return sendJson(res, { ok: false, error: 'invalid json' }, 400);
       const caseObj = await loadCaseById(id);
       if (!caseObj) return sendJson(res, { ok: false, error: 'not found' }, 404);
@@ -998,7 +1266,7 @@ async function handleRequest(req, res) {
       const token = crypto.randomBytes(24).toString('base64url');
       pruneEvidenceLinks();
       if (evidenceLinks.size >= 5000) return sendJson(res, { ok: false, error: 'evidence link capacity reached' }, 503);
-      evidenceLinks.set(token, { caseId: id, fileName: file.name, expiresAt: Date.now() + 5 * 60 * 1000, used: false });
+      evidenceLinks.set(token, { caseId: id, fileName: file.name, issuer: session.username, expiresAt: Date.now() + 5 * 60 * 1000, used: false });
       await auditEvent('EVIDENCE_LINK', session, id);
       return sendJson(res, { ok: true, token, expiresInSeconds: 300, note: 'Prototype single-use download token. Not a production evidence-sharing network.' });
     });
@@ -1010,17 +1278,20 @@ async function handleRequest(req, res) {
     if (token === null) return;
     const link = evidenceLinks.get(token);
     if (!link || link.used || Date.now() > link.expiresAt) return sendJson(res, { ok: false, error: 'link expired or already used' }, 410);
+    // Claim the single-use token before storage awaits allow another request in.
+    evidenceLinks.delete(token);
     const caseObj = await loadCaseById(link.caseId);
+    if (caseObj?.reviewLocked) return sendJson(res, { ok: false, error: 'Reporter paused access' }, 423);
     const file = (caseObj?.files || []).find(item => item.name === link.fileName);
     if (!file || !canDownloadMaskedCopy(file)) return sendJson(res, { ok: false, error: 'masked evidence unavailable' }, 404);
-    evidenceLinks.delete(token);
     const evidencePath = path.join(DATA_DIR, file.name);
     const encryptedArtifact = await vault.readArtifact(file.name);
     if (!encryptedArtifact) return sendJson(res, { ok: false, error: 'evidence unavailable' }, 404);
     try {
-      const content = decryptBuffer(encryptedArtifact, `evidence:${link.caseId}:${file.name}`);
+      const content = decryptBuffer(encryptedArtifact, `evidence:${link.caseId}:${file.name}`, caseDataKey(caseObj));
       if (computeHash(content) !== file.sanitizedHash || await findLedgerHash(link.caseId, file.name) !== file.sanitizedHash) throw new Error('evidence integrity mismatch');
       const downloadName = maskedDownloadName(link.caseId, file);
+      await auditEvent('SHARED_EVIDENCE_ACCESS', { username: `link issued by ${link.issuer}`, role: 'SHARED_LINK' }, link.caseId);
       res.writeHead(200, { ...corsHeaders({ 'Content-Security-Policy': "sandbox; default-src 'none'" }), 'Content-Type': 'application/octet-stream', 'Content-Disposition': `attachment; filename="${downloadName}"` });
       return res.end(content);
     } catch (error) {
@@ -1050,6 +1321,9 @@ async function handleRequest(req, res) {
     const lines = await vault.readLog('audit');
     if (!verifySignedLines(lines)) return sendJson(res, { ok: false, error: 'audit log integrity check failed' }, 409);
     const events = lines.map(line => { const { mac, previousHash, ...event } = JSON.parse(line); return event; });
+    for (const id of new Set(events.map(event => event.caseId).filter(Boolean))) {
+      if (await loadCaseById(id)) await auditEvent('CASE_AUDIT_VIEW', session, id);
+    }
     return sendJson(res, { ok: true, events, integrity: 'VERIFIED' });
   }
 
@@ -1060,7 +1334,7 @@ async function handleRequest(req, res) {
     if (!caseObj) return sendJson(res, { ok: false, error: 'not found' }, 404);
     const session = requirePermission(req, res, 'evidence:original', caseObj);
     if (!session) return;
-    readJson(req, async (obj, error) => {
+    return readJson(req, async (obj, error) => {
       if (error) return sendJson(res, { ok: false, error: 'invalid json' }, 400);
       const reason = String(obj.reason || '').trim();
       if (reason.length < 20 || reason.length > 500 || !judicialKeyValid(obj.key)) {
@@ -1068,7 +1342,9 @@ async function handleRequest(req, res) {
         return sendJson(res, { ok: false, error: 'valid judicial key and a reason of 20–500 characters required' }, 403);
       }
       await auditEvent('JUDICIAL_DETAILS_ACCESS', session, id, { reason });
+      const location = reporterSecurity.revealLocation(caseObj.locationEnvelope, id, obj.key);
       return sendJson(res, { ok: true, details: {
+        location,
         reporterId: caseObj.reporterId || null,
         title: caseObj.title || '',
         description: caseObj.originalDescription || caseObj.description || '',
@@ -1091,6 +1367,7 @@ async function handleRequest(req, res) {
     if (!session) return;
     const file = findEvidence(caseObj, identifier);
     if (!file) return sendJson(res, { ok: false, error: 'evidence not found' }, 404);
+    if (jobPending(file)) return sendJson(res, { ok: false, error: 'Masking is already queued or running.' }, 409);
     const isVideo = String(file.mime || '').startsWith('video/');
     const isAudio = String(file.mime || '').startsWith('audio/');
     const isImage = String(file.mime || '').startsWith('image/');
@@ -1099,12 +1376,12 @@ async function handleRequest(req, res) {
     if (canDownloadMaskedCopy(file)) return sendJson(res, { ok: false, error: 'masked copy already exists' }, 409);
     const releaseGrant = consumeOriginalGrant(req, session, id, file);
     if (!releaseGrant) return sendJson(res, { ok: false, error: 'Your access key, viewer photo, and one-time original grant are required to reprocess evidence' }, 403);
-    (async () => {
+    return (async () => {
       try {
         const stored = await vault.readArtifact(file.originalArtifact);
         const context = `evidence:${id}:${file.originalArtifact}`;
-        const original = courtVault.isSealed(stored) ? courtVault.openOriginal(stored, context, releaseGrant.dataKey) : decryptBuffer(stored, context);
-        if (computeHash(original) !== file.originalHash) throw new Error('original integrity mismatch');
+        const original = courtVault.isSealed(stored) ? courtVault.openOriginal(stored, context, releaseGrant.dataKey) : decryptBuffer(stored, context, caseDataKey(caseObj));
+        if (computeHash(original) !== file.originalHash || (/^CASE-V[23]-/.test(id) && await findLedgerHash(id, file.originalArtifact) !== file.originalHash)) throw new Error('original integrity mismatch');
         const processed = isText
           ? { status: 'COMPLETE', buffer: maskTextEvidence(original), error: null, transformations: ['TEXT_CONTENT_MASKED'] }
           : await processMediaPrivacy(original, isVideo ? 'video' : isAudio ? 'audio' : 'image');
@@ -1112,23 +1389,23 @@ async function handleRequest(req, res) {
         file.processingError = processed.error;
         file.transformations = processed.transformations;
         if (processed.status !== 'COMPLETE') {
-          await saveCase(caseObj);
           await auditEvent('MEDIA_REPROCESS_FAILED', session, id, { evidenceId: evidencePublicId(id, file.name) });
+          await saveCase(caseObj);
           return sendJson(res, { ok: false, error: processed.error }, 422);
         }
         // Never replace an existing object before the case revision is committed.
         file.previousNames = [...(file.previousNames || []), file.name];
         file.name = `${id}-${crypto.randomUUID()}.sanitized`;
-        await vault.writeArtifact(file.name, encryptBuffer(processed.buffer, `evidence:${id}:${file.name}`));
+        await vault.writeArtifact(file.name, encryptBuffer(processed.buffer, `evidence:${id}:${file.name}`, caseDataKey(caseObj)));
         file.sanitizedHash = computeHash(processed.buffer);
         file.hash = file.sanitizedHash;
         file.derivativeMime = isVideo ? 'video/mp4' : isAudio ? 'audio/wav' : isImage ? 'image/png' : 'text/plain';
         file.privacyVersion = PRIVACY_DERIVATIVE_VERSION;
-        if (isImage) { file.metadataSanitized = true; file.metadataRemoved = true; }
+        if (!isText) { file.metadataSanitized = true; file.metadataRemoved = true; }
         await appendLedger(id, file.name, file.sanitizedHash);
-        await saveCase(caseObj);
         await auditEvent('MEDIA_REPROCESSED', session, id, { evidenceId: evidencePublicId(id, file.name) });
-        return sendJson(res, { ok: true, case: redactCase(caseObj) });
+        await saveCase(caseObj);
+        return sendJson(res, { ok: true, case: redactCase(caseObj, { includeMessages: ROLE_PERMISSIONS[session.role]?.includes('chat:read'), includeNotes: ROLE_PERMISSIONS[session.role]?.includes('notes:read') }) });
       } catch (error) {
         return sendJson(res, { ok: false, error: 'media reprocessing failed' }, 500);
       } finally {
@@ -1154,6 +1431,7 @@ async function handleRequest(req, res) {
     if (viewerChallenges.size >= 5000) return sendJson(res, { ok: false, error: 'Access service busy' }, 503);
     const challenge = crypto.randomBytes(32).toString('base64url');
     viewerChallenges.set(challenge, { session, caseId: id, artifact: file.originalArtifact, expiresAt: Date.now() + 120000 });
+    await auditEvent('ORIGINAL_ACCESS_REQUESTED', session, id);
     return sendJson(res, { ok: true, challenge, expiresInSeconds: 120 });
   }
 
@@ -1167,7 +1445,7 @@ async function handleRequest(req, res) {
     if (!session) return;
     const file = findEvidence(caseObj, identifier);
     if (!file) return sendJson(res, { ok: false, error: 'evidence not found' }, 404);
-    readJson(req, async (obj, error) => {
+    return readJson(req, async (obj, error) => {
       if (error) return sendJson(res, { ok: false, error: 'invalid json' }, 400);
       const reason = String(obj.reason || '').trim();
       const orderReference = String(obj.orderReference || '').trim();
@@ -1193,6 +1471,7 @@ async function handleRequest(req, res) {
         return sendJson(res, { ok: false, error: 'Access audit unavailable. No original was released.' }, 503);
       }
       pruneOriginalGrants();
+      if (!sessionActive(session)) return sendJson(res, { ok: false, error: 'Session expired', code: 'SESSION_EXPIRED' }, 401);
       if (originalGrants.size >= 5000) return sendJson(res, { ok: false, error: 'original access capacity reached' }, 503);
       const grant = crypto.randomBytes(32).toString('base64url');
       originalGrants.set(grant, { session, caseId: id, artifact: file.originalArtifact, accessId, expiresAt: Date.now() + 60000 });
@@ -1230,12 +1509,14 @@ async function handleRequest(req, res) {
       const encryptedArtifact = await vault.readArtifact(artifactName);
       if (!encryptedArtifact) return sendJson(res, { ok: false, error: 'evidence unavailable' }, 404);
       const context = `evidence:${id}:${artifactName}`;
-      const content = original && courtVault.isSealed(encryptedArtifact) ? courtVault.openOriginal(encryptedArtifact, context, releaseGrant.dataKey) : decryptBuffer(encryptedArtifact, context);
+      const content = original && courtVault.isSealed(encryptedArtifact) ? courtVault.openOriginal(encryptedArtifact, context, releaseGrant.dataKey) : decryptBuffer(encryptedArtifact, context, caseDataKey(caseObj));
       const expectedHash = original ? file.originalHash : (file.sanitizedHash || file.hash);
       if (!expectedHash || computeHash(content) !== expectedHash) throw new Error('evidence integrity mismatch');
-      if (!original && await findLedgerHash(id, file.name) !== expectedHash) throw new Error('evidence ledger mismatch');
+      if ((!original || /^CASE-V[23]-/.test(id)) && await findLedgerHash(id, artifactName) !== expectedHash) throw new Error('evidence ledger mismatch');
       const downloadName = original ? safeDownloadName(file.original) : maskedDownloadName(id, file);
       if (original) await auditEvent('ORIGINAL_EVIDENCE_ACCESS', session, id, { evidenceId: evidencePublicId(id, file.name), accessId: releaseGrant.accessId });
+      else await auditEvent('MASKED_EVIDENCE_ACCESS', session, id, { evidenceId: evidencePublicId(id, file.name) });
+      if (!sessionActive(session)) return sendJson(res, { ok: false, error: 'Session expired', code: 'SESSION_EXPIRED' }, 401);
       res.writeHead(200, { ...corsHeaders({ 'Content-Security-Policy': "sandbox; default-src 'none'" }), 'Content-Type': 'application/octet-stream', 'Content-Disposition': `attachment; filename="${downloadName}"` });
       return res.end(content);
     } catch (error) {
@@ -1259,7 +1540,7 @@ async function handleRequest(req, res) {
         const filePath = path.join(DATA_DIR, fileName);
         let actualHash = null;
         try{
-          const buf = decryptBuffer(await vault.readArtifact(path.basename(filePath)), `evidence:${id}:${fileName}`);
+          const buf = decryptBuffer(await vault.readArtifact(path.basename(filePath)), `evidence:${id}:${fileName}`, caseDataKey(caseObj));
           actualHash = computeHash(buf);
         }catch(e){
           actualHash = null;
@@ -1284,7 +1565,9 @@ async function handleRequest(req, res) {
       if (!caseObj) return sendJson(res, { ok: false, error: 'not found' }, 404);
       const session = requirePermission(req, res, 'evidence:verify', caseObj);
       if (!session) return;
-      return sendJson(res, { ok: true, verification: await buildVerification(caseObj, await loadCases()) });
+      const visibleCases = (await loadCases()).filter(item => !item.reviewLocked && (session.role !== 'INVESTIGATOR' || (item.assignedTo || []).includes(session.username)));
+      await auditEvent('CASE_VERIFICATION_VIEW', session, id);
+      return sendJson(res, { ok: true, verification: await buildVerification(caseObj, visibleCases) });
     } catch (e) {
       return sendJson(res, { ok: false, error: 'could not build verification' }, 500);
     }
@@ -1301,7 +1584,33 @@ server.maxRequestsPerSocket = 100;
 server.on('clientError', (error, socket) => {
   if (socket.writable) socket.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n');
 });
+const evidenceWorker = createEvidenceWorker({
+  listPending: async () => (await vault.listProcessingCases()).map(hydrateCase),
+  loadCase: loadCaseById,
+  saveCase,
+  readOriginal: async (record, file) => decryptBuffer(await vault.readArtifact(file.originalArtifact), `evidence:${record.id}:${file.originalArtifact}`, caseDataKey(record)),
+  process: (bytes, mime) => processMediaPrivacy(bytes, mime.startsWith('video/') ? 'video' : mime.startsWith('audio/') ? 'audio' : 'image'),
+  writeDerivative: (id, name, bytes, source, sourceFile) => withCaseLock(id, async () => {
+    const current = await loadCaseById(id);
+    const file = current?.files.find(file => file.originalArtifact === sourceFile.originalArtifact);
+    if (!file || current.keyEnvelope !== source.keyEnvelope || file.processingJob?.claimId !== sourceFile.processingJob?.claimId) return false;
+    file.processingJob.outputArtifact = name;
+    await saveCase(current);
+    await vault.writeArtifact(name, encryptBuffer(bytes, `evidence:${id}:${name}`, caseDataKey(current)));
+    return true;
+  }),
+  removeDerivative: name => vault.removeArtifact(name),
+  hash: computeHash,
+  ledgerHash: findLedgerHash,
+  appendLedger,
+  audit: (event, id) => auditEvent(event, { username: 'privacy-worker', role: 'SYSTEM' }, id),
+  timeline: appendTimeline,
+  privacyVersion: PRIVACY_DERIVATIVE_VERSION,
+  onError: () => console.error(JSON.stringify({ event: 'EVIDENCE_WORKER_RETRY', kind: 'storage-or-integrity' })),
+});
 async function start() {
+  const storageSecret = requireSecret('SENTINELQ_STORAGE_KEY', 32);
+  if (storageSecret === requireSecret('SENTINELQ_AUDIT_KEY', 32)) throw new Error('Storage and audit keys must be independent');
   if (process.env.NODE_ENV === 'production') {
     if (process.env.SENTINELQ_ALLOW_DEMO_ADMIN === '1' && process.env.SENTINELQ_ADMIN_PASSWORD === 'admin') throw new Error('admin/admin is permitted only for a loopback development server');
     if (vault.provider !== 'supabase' || !REQUIRE_HTTPS || !TRUST_PROXY || !/^https:\/\/[^/]+$/.test(ALLOWED_ORIGIN) || process.env.SENTINELQ_ALLOW_DEMO_ADMIN === '1' || process.env.SENTINELQ_SEED_DEMO === '1') {
@@ -1310,6 +1619,10 @@ async function start() {
     if (serveFrontend && !fs.existsSync(path.join(__dirname, '..', 'frontend', 'dist', 'index.html'))) throw new Error('Build the frontend before starting production');
   }
   await vault.init();
+  // Recover interrupted rotations/deletions before accepting requests.
+  for (const row of await vault.listCases()) {
+    if (row.payload.cleanupScanPending || row.payload.cleanupArtifacts?.length || row.payload.stagedArtifacts?.length) await reporterControls.cleanup(row.payload.id);
+  }
   // Validate both encryption and signing keys against this vault before serving.
   await vault.checkKeys(
     value => encryptBuffer(Buffer.from(value), requireSecret('SENTINELQ_AUDIT_KEY', 32)).toString('base64'),
@@ -1323,7 +1636,19 @@ async function start() {
     AUTHORITY_USERS = await vault.bootstrapAuthorities(loadAuthorityUsers());
   }
   await seedDemoCases();
-  server.listen(PORT, HOST, () => console.log('SentinelQ server running on ' + HOST + ':' + PORT + ' (' + vault.provider + ' storage)'));
+  server.listen(PORT, HOST, () => {
+    console.log('SentinelQ v2 server running on ' + HOST + ':' + server.address().port + ' (' + vault.provider + ' storage)');
+    evidenceWorker.start();
+    retiredCleanupTimer = setInterval(cleanupRetiredArtifacts, 30000);
+    retiredCleanupTimer.unref();
+  });
+  const shutdown = () => {
+    clearInterval(retiredCleanupTimer);
+    server.close();
+    evidenceWorker.stop().finally(() => { clearInterval(grantCleanup); server.closeIdleConnections(); });
+  };
+  process.once('SIGTERM', shutdown);
+  process.once('SIGINT', shutdown);
 }
 if (require.main === module) start().catch(error => { console.error('Startup refused: ' + (error instanceof StorageError || /permitted only|Cloud storage requires|^SENTINELQ_[A-Z_]+ must be configured/.test(error.message) ? error.message : 'Check storage configuration and encryption keys.')); process.exitCode = 1; });
 module.exports = { encryptBuffer, decryptBuffer, encryptCaseFields, decryptCaseFields, verifySignedLines, loadAuthorityUsers };
@@ -1357,7 +1682,14 @@ function stripJpegExif(buf){
 }
 
 function canDownloadMaskedCopy(file){
-  return Boolean(file?.sanitizedHash && file.privacyVersion === PRIVACY_DERIVATIVE_VERSION && file.mime !== 'application/pdf');
+  return Boolean(file?.sanitizedHash && file.processingStatus === 'COMPLETE' && file.privacyVersion === PRIVACY_DERIVATIVE_VERSION && file.mime !== 'application/pdf');
+}
+
+function evidenceStatus(file) {
+  if (canDownloadMaskedCopy(file)) return 'COMPLETE';
+  if (file.mime === 'application/pdf') return 'QUARANTINED';
+  if (jobPending(file)) return file.processingStatus;
+  return file.processingStatus === 'FAILED' ? 'FAILED' : 'NEEDS_MASKING';
 }
 
 function evidencePublicId(caseId, fileName){
@@ -1440,7 +1772,7 @@ function inspectUpload(name, buf){
   if (ext === '.mp3' && !(buf.subarray(0,3).toString() === 'ID3' || (buf[0] === 0xff && (buf[1] & 0xe0) === 0xe0))) return { ok: false, error: 'mp3 signature mismatch' };
   if (ext === '.m4a' && buf.subarray(4,8).toString() !== 'ftyp') return { ok: false, error: 'm4a signature mismatch' };
   if (ext === '.ogg' && buf.subarray(0,4).toString() !== 'OggS') return { ok: false, error: 'ogg signature mismatch' };
-  if (ext === '.txt' && buf.includes(0)) return { ok: false, error: 'text file contains binary data' };
+  if (ext === '.txt' && (buf.includes(0) || !buf.toString('utf8').trim())) return { ok: false, error: 'text file is blank or contains binary data' };
   return { ok: true, notes: [] };
 }
 
@@ -1449,22 +1781,36 @@ function maskTextEvidence(buf){
 }
 
 async function processMediaPrivacy(buf, kind){
+  try { return await withMediaSlot(() => processMediaPrivacyInSlot(buf, kind)); }
+  catch { return { status: 'FAILED', buffer: null, error: 'Privacy processing busy; original remains restricted.', transformations: [] }; }
+}
+
+async function processMediaPrivacyInSlot(buf, kind){
   const directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'sentinelq-media-'));
   const input = path.join(directory, 'source');
   try {
+    await fs.promises.chmod(directory, 0o700);
     await fs.promises.writeFile(input, buf, { mode: 0o600 });
-    const base = ['-v', 'error', '-nostdin', '-threads', '1', '-filter_threads', '1', '-protocol_whitelist', 'file,pipe', '-i', input, '-threads', '1'];
-    const visualMask = 'scale=8:-2:flags=area,scale=480:-2:flags=neighbor,gblur=sigma=12';
+    // Force the signature-selected demuxer. Playlists cannot request other
+    // files or URLs. MP4 external data references remain disabled explicitly.
+    const format = buf.subarray(4, 8).toString() === 'ftyp' ? 'mov'
+      : buf.subarray(0, 4).toString('hex') === '1a45dfa3' ? 'matroska'
+        : buf.subarray(0, 8).toString('hex') === '89504e470d0a1a0a' ? 'png_pipe'
+          : buf[0] === 0xff && buf[1] === 0xd8 ? 'jpeg_pipe'
+            : buf.subarray(0, 4).toString() === 'RIFF' ? 'wav'
+              : buf.subarray(0, 4).toString() === 'OggS' ? 'ogg' : 'mp3';
+    const base = ['-v', 'error', '-nostdin', '-max_alloc', '67108864', '-threads', '1', '-filter_threads', '1', '-protocol_whitelist', 'file,pipe', '-f', format, ...(format === 'mov' ? ['-enable_drefs', '0', '-use_absolute_path', '0'] : []), '-i', input, '-threads', '1'];
+    const visualMask = 'scale=8:8:flags=area:force_original_aspect_ratio=decrease:force_divisible_by=2,scale=480:480:flags=neighbor:force_original_aspect_ratio=decrease:force_divisible_by=2,gblur=sigma=12';
     // Pitch/formant shift plus modulation; words remain audible and require content review.
-    const voiceMask = 'aresample=32000,asetrate=23040,aresample=32000,atempo=1.3888889,highpass=f=120,lowpass=f=3500,vibrato=f=7:d=0.6';
+    // Quantize after modulation before AAC encoding. Some FFmpeg builds can
+    // produce non-finite tail samples for very short inputs; PCM bounds them.
+    const voiceMask = 'aresample=32000,asetrate=23040,aresample=32000,atempo=1.3888889,highpass=f=120,lowpass=f=3500,vibrato=f=7:d=0.6,aformat=sample_fmts=s16';
     const args = kind === 'video'
       ? [...base, '-map', '0:v:0', '-map', '0:a:0?', '-vf', `${visualMask},format=yuv420p`, '-af', voiceMask, '-map_metadata', '-1', '-map_chapters', '-1', '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '30', '-c:a', 'aac', '-ac', '1', '-f', 'mp4', '-movflags', 'frag_keyframe+empty_moov', 'pipe:1']
       : kind === 'image'
         ? [...base, '-map', '0:v:0', '-frames:v', '1', '-vf', visualMask, '-map_metadata', '-1', '-c:v', 'png', '-f', 'image2pipe', 'pipe:1']
         : [...base, '-map', '0:a:0', '-af', voiceMask, '-map_metadata', '-1', '-map_chapters', '-1', '-c:a', 'pcm_s16le', '-ar', '16000', '-ac', '1', '-f', 'wav', 'pipe:1'];
-    const output = await new Promise((resolve, reject) => {
-      execFile(process.env.SENTINELQ_FFMPEG_PATH || 'ffmpeg', args, { encoding: 'buffer', maxBuffer: 32 * 1024 * 1024, timeout: 60000, windowsHide: true }, (error, stdout) => error ? reject(error) : resolve(stdout));
-    });
+    const output = await runFFmpeg(args);
     const signatureValid = kind === 'video' ? output.subarray(4, 8).toString() === 'ftyp'
       : kind === 'image' ? output.subarray(0, 8).toString('hex') === '89504e470d0a1a0a'
         : output.subarray(0, 4).toString() === 'RIFF';
@@ -1488,10 +1834,11 @@ async function countDuplicateEvidence(hash, currentCaseId){
 async function buildVerification(caseObj, allCases){
   const files = Array.isArray(caseObj.files) ? caseObj.files : [];
   const relatedCases = findRelatedCases(caseObj, allCases);
-  const evidenceResults = await Promise.all(files.map(file => verifyEvidenceRecord(caseObj.id, file)));
+  const evidenceResults = await Promise.all(files.map(file => verifyEvidenceRecord(caseObj.id, file, caseDataKey(caseObj))));
   const verifiedCount = evidenceResults.filter(result => result.status === 'VERIFIED').length;
   const integrityVerified = files.length > 0 && verifiedCount === files.length;
-  const duplicateCount = files.filter(file => file.duplicateCaseCount > 0).length;
+  const duplicateCount = files.filter(file => allCases.some(other => other.id !== caseObj.id && other.files?.some(candidate => candidate.originalHash === file.originalHash))).length;
+  const pendingCount = files.filter(jobPending).length;
   const spamRisk = caseObj.spamRisk || (duplicateCount > 0 || relatedCases.length > 3 ? 'REVIEW' : 'LOW');
   const score = files.length ? Math.round((verifiedCount / files.length) * 100) : 0;
   const signals = [];
@@ -1499,19 +1846,21 @@ async function buildVerification(caseObj, allCases){
   if (files.length > 0) signals.push({ name: 'Evidence artifact integrity', value: `${verifiedCount}/${files.length} verified`, weight: score, detail: 'Artifacts were authenticated, decrypted, hashed, and compared with the signed ledger.' });
   if (relatedCases.length > 0) signals.push({ name: 'Similarity candidates', value: `${relatedCases.length} case(s)`, weight: 0, detail: 'Text similarity is only a review lead. It is not independent corroboration and does not affect integrity.' });
   if (duplicateCount > 0) { warnings.push(`Duplicate evidence detected in ${duplicateCount} evidence record(s); this is not proof of abuse.`); }
-  if (!integrityVerified && files.length) warnings.push('One or more evidence artifacts failed cryptographic verification or are unavailable.');
-  const level = !files.length ? 'No evidence attached' : integrityVerified ? 'Artifact integrity confirmed' : 'Artifact integrity alert';
+  if (pendingCount) warnings.push(`${pendingCount} evidence item(s) are being masked. Pending copies have not yet been verified.`);
+  if (!integrityVerified && files.length > pendingCount) warnings.push('One or more evidence artifacts failed cryptographic verification or are unavailable.');
+  const level = !files.length ? 'No evidence attached' : integrityVerified ? 'Artifact integrity confirmed' : pendingCount === files.length ? 'Evidence masking in progress' : evidenceResults.some(result => ['MISMATCH', 'AUTHENTICATION_FAILED', 'MISSING'].includes(result.status)) ? 'Artifact integrity alert' : 'Evidence review required';
   return { score, level, signals, warnings, evidenceResults, relatedCases: relatedCases.map(item => ({ id: item.id, sharedSignalCount: sharedSignals(caseObj, item).length })), spamRisk, integrity: integrityVerified ? 'VERIFIED' : 'UNVERIFIED', disclaimer: 'This verifies file custody only. It does not establish truth, independence, identity, intent, or guilt.' };
 }
 
-async function verifyEvidenceRecord(caseId, file){
+async function verifyEvidenceRecord(caseId, file, key){
   const label = file?.name ? `Evidence ${evidencePublicId(caseId, file.name).slice(0, 8)}` : 'Evidence';
-  if (!file?.name || !file.sanitizedHash) return { name: label, status: 'UNAVAILABLE' };
+  if (jobPending(file)) return { name: label, status: 'PROCESSING' };
+  if (!file?.name || !canDownloadMaskedCopy(file)) return { name: label, status: 'UNAVAILABLE' };
   const artifactPath = path.join(DATA_DIR, file.name);
   try {
     const encryptedArtifact = await vault.readArtifact(file.name);
     if (!encryptedArtifact) return { name: label, status: 'MISSING' };
-    const plaintext = decryptBuffer(encryptedArtifact, `evidence:${caseId}:${file.name}`);
+    const plaintext = decryptBuffer(encryptedArtifact, `evidence:${caseId}:${file.name}`, key);
     const actualHash = computeHash(plaintext);
     const ledgerHash = await findLedgerHash(caseId, file.name);
     const status = actualHash === file.sanitizedHash && actualHash === ledgerHash ? 'VERIFIED' : 'MISMATCH';
@@ -1553,19 +1902,16 @@ async function appendLedger(caseId, fileName, hash){
   });
 }
 
-function encryptBuffer(buf, aad = ''){
-  const key = getStorageKey();
-  const iv = crypto.randomBytes(12);
-  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
-  cipher.setAAD(Buffer.from(aad));
-  const ciphertext = Buffer.concat([cipher.update(buf), cipher.final()]);
-  return Buffer.concat([Buffer.from('SQE2'), iv, cipher.getAuthTag(), ciphertext]);
+function encryptBuffer(buf, aad = '', key = getStorageKey()){
+  return postQuantum.encrypt(buf, key, aad);
 }
 
-function decryptBuffer(value, aad = ''){
+function decryptBuffer(value, aad = '', key = getStorageKey()){
+  if (!Buffer.isBuffer(value) || value.length < 32) throw new Error('invalid evidence envelope');
   const version = value.subarray(0, 4).toString();
+  if (version === 'SQE3') return postQuantum.decrypt(value, key, aad);
   if (version !== 'SQE1' && version !== 'SQE2') throw new Error('unsupported evidence format');
-  const decipher = crypto.createDecipheriv('aes-256-gcm', getStorageKey(), value.subarray(4, 16));
+  const decipher = crypto.createDecipheriv('aes-256-gcm', key, value.subarray(4, 16));
   if (version === 'SQE2') decipher.setAAD(Buffer.from(aad));
   decipher.setAuthTag(value.subarray(16, 32));
   return Buffer.concat([decipher.update(value.subarray(32)), decipher.final()]);
@@ -1723,8 +2069,8 @@ async function maybeRemoteAi(text){
   }
 }
 
-function encryptMessage(text, caseId, messageId){
-  return encryptBuffer(Buffer.from(text || ''), `message:${caseId}:${messageId}`).toString('base64');
+function encryptMessage(text, caseId, messageId, key){
+  return encryptBuffer(Buffer.from(text || ''), `message:${caseId}:${messageId}`, key).toString('base64');
 }
 
 function validateAiBaseUrl(value, authenticated){
@@ -1740,11 +2086,11 @@ function validateAiBaseUrl(value, authenticated){
   }
 }
 
-function decryptMessage(payload, caseId, messageId){
+function decryptMessage(payload, caseId, messageId, key){
   try {
     const value = Buffer.from(payload || '', 'base64');
-    if (!['SQE1', 'SQE2'].includes(value.subarray(0, 4).toString())) return '[legacy message unavailable]';
-    return decryptBuffer(value, `message:${caseId}:${messageId}`).toString('utf8');
+    if (!['SQE1', 'SQE2', 'SQE3'].includes(value.subarray(0, 4).toString())) return '[legacy message unavailable]';
+    return decryptBuffer(value, `message:${caseId}:${messageId}`, key).toString('utf8');
   } catch (error) {
     return '[message authentication failed]';
   }
@@ -1756,7 +2102,7 @@ function getStorageKey(){
 
 function messagesForCase(caseObj) {
   if (!caseObj) return [];
-  return (caseObj.messages || []).map(message => ({ id: message.id, sender: message.sender || 'authority', text: decryptMessage(message.text, caseObj.id, message.id), createdAt: message.createdAt || new Date().toISOString() }));
+  return (caseObj.messages || []).map(message => ({ id: message.id, sender: message.sender || 'authority', text: decryptMessage(message.text, caseObj.id, message.id, caseDataKey(caseObj)), createdAt: message.createdAt || new Date().toISOString() }));
 }
 async function loadMessages(id){ return messagesForCase(await loadCaseById(id)); }
 
@@ -1766,16 +2112,18 @@ function refreshDeadMan(caseObj){
 }
 
 function hydrateCase(row) {
+  if (row.payload.deleted) { verifyCase(row.payload, getStorageKey()); return null; }
   const value = normalizeCase(decryptCaseFields(row.payload));
   Object.defineProperty(value, '_revision', { value: row.revision, writable: true, configurable: true });
   return value;
 }
 async function loadCases(){
-  return (await vault.listCases()).map(hydrateCase).sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+  return (await vault.listCases()).map(hydrateCase).filter(Boolean).sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
 }
 async function loadCaseById(id){
   if (!validCaseId(id)) return null;
   const row = await vault.getCase(id);
+  if (row && row.payload.id !== id) throw new Error('Case identity mismatch');
   return row ? hydrateCase(row) : null;
 }
 
@@ -1799,6 +2147,16 @@ function normalizeCase(caseObj){
     assignedTo: Array.isArray(caseObj.assignedTo) ? caseObj.assignedTo : [],
     createdAt: caseObj.createdAt || new Date().toISOString(),
     recoveryHash: caseObj.recoveryHash || null,
+    submissionHash: caseObj.submissionHash || null,
+    keyEnvelope: caseObj.keyEnvelope || null,
+    keyVersion: caseObj.keyVersion || 0,
+    locationEnvelope: caseObj.locationEnvelope || null,
+    complaintFingerprint: caseObj.complaintFingerprint || null,
+    emergencyOperation: caseObj.emergencyOperation || null,
+    cleanupArtifacts: caseObj.cleanupArtifacts || [],
+    stagedArtifacts: caseObj.stagedArtifacts || [],
+    reviewLocked: Boolean(caseObj.reviewLocked),
+    alertsSeenThrough: caseObj.alertsSeenThrough || 0,
     regionBucket: caseObj.regionBucket || 'unspecified',
     threat: caseObj.threat || { identityRisk: 0, metadataRisk: 0, evidenceRisk: 0 },
     privacyWarnings: caseObj.privacyWarnings || [],
@@ -1806,6 +2164,7 @@ function normalizeCase(caseObj){
     demonstration: Boolean(caseObj.demonstration),
     honey: Boolean(caseObj.honey),
     security: caseObj.security || {},
+    processingPending: (caseObj.files || []).some(jobPending),
     spamRisk: caseObj.spamRisk,
     affiliationVerified: caseObj.affiliationVerified,
     followupConsistency: caseObj.followupConsistency
@@ -1931,7 +2290,7 @@ async function seedDemoCases(){
       demonstration: true,
       honey: Boolean(demo.honey),
       threat: { identityRisk: 18, metadataRisk: 4, evidenceRisk: 8 },
-      security: { encrypted: true, ledgered: false, algorithm: 'aes-256-gcm', pqc: 'not-implemented', ledger: 'signed-local-hash-chain' }
+      security: { encrypted: true, ledgered: false, algorithm: 'ml-kem-768+hkdf-sha512+aes-256-gcm', caseSignature: 'ml-dsa-65', pqc: 'implemented', ledger: 'signed-local-hash-chain' }
     };
     await saveCase(caseObj);
   }

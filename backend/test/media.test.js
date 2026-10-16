@@ -31,6 +31,24 @@ function request(method, route, body, token, extraHeaders = {}) {
   });
 }
 
+async function waitForMedia(id, token) {
+  let last;
+  for (let attempt = 0; attempt < 100; attempt++) {
+    const response = await request('GET', `/cases/${id}`, null, token);
+    assert.equal(response.status, 200, JSON.stringify(response.body));
+    last = response.body.case.files.map(file => ({ mime: file.mime, status: file.processingStatus }));
+    if (response.body.case.files.every(file => !['QUEUED', 'PROCESSING', 'RETRY_WAIT'].includes(file.processingStatus))) return response;
+    await new Promise(resolve => setTimeout(resolve, 200));
+  }
+  assert.fail('Background masking did not finish: ' + JSON.stringify(last));
+}
+function saveTrustedFixture(filename, record) {
+  // Simulate a valid old privacy state using the test signing key. Untested
+  // edits are now rejected as manifest tampering, separately asserted below.
+  const key = require('node:crypto').createHash('sha256').update('test-storage-key-2026-at-least-thirty-two-characters').digest();
+  fs.writeFileSync(filename, JSON.stringify({ ...require('../case-integrity').sealCase(record, key), _localRevision: record._localRevision }));
+}
+
 test('media derivatives mask images, video, text and speech while keeping encrypted originals', { skip: !ffmpegAvailable }, async t => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'sentinelq-media-test-'));
   const audioPath = path.join(directory, 'sample.wav');
@@ -76,12 +94,9 @@ test('media derivatives mask images, video, text and speech while keeping encryp
     { name: 'sample.txt', data: sourceText.toString('base64') }
   ] });
   assert.equal(report.status, 200, JSON.stringify(report.body));
-  for (const file of report.body.files) {
-    assert.equal(file.processingStatus, 'COMPLETE', `Privacy processing failed for ${file.mime}`);
-    assert.notEqual(file.originalHash, file.sanitizedHash);
-  }
+  assert.deepEqual(report.body.files.map(file => file.processingStatus), ['QUEUED', 'QUEUED', 'QUEUED', 'QUEUED', 'COMPLETE']);
 
-  const caseView = await request('GET', `/cases/${report.body.id}`, null, token);
+  const caseView = await waitForMedia(report.body.id, token);
   assert.equal(caseView.status, 200);
   assert.equal(caseView.body.case.files[0].originalArtifact, undefined);
   assert.equal(caseView.body.case.files[0].original, 'Evidence 1');
@@ -148,6 +163,8 @@ test('media derivatives mask images, video, text and speech while keeping encryp
   const storedCase = JSON.parse(fs.readFileSync(storedCasePath, 'utf8'));
   storedCase.files[2].privacyVersion = null;
   fs.writeFileSync(storedCasePath, JSON.stringify(storedCase));
+  assert.equal((await request('GET', `/cases/${report.body.id}/evidence/${caseView.body.case.files[2].name}`, null, token)).status, 503);
+  saveTrustedFixture(storedCasePath, storedCase);
   const legacyView = await request('GET', `/cases/${report.body.id}`, null, token);
   assert.equal(legacyView.body.case.files[2].maskedCopyAvailable, false);
   assert.equal(legacyView.body.case.files[2].processingStatus, 'NEEDS_MASKING');
@@ -166,7 +183,7 @@ test('media derivatives mask images, video, text and speech while keeping encryp
   legacyVideo.files[1].hash = null;
   legacyVideo.files[1].privacyVersion = null;
   legacyVideo.files[1].processingStatus = 'FAILED';
-  fs.writeFileSync(storedCasePath, JSON.stringify(legacyVideo));
+  saveTrustedFixture(storedCasePath, legacyVideo);
   const videoRelease = await request('POST', `/cases/${report.body.id}/evidence/${caseView.body.case.files[1].name}/original-access`, await viewer.accessBody(request, `/cases/${report.body.id}/evidence/${caseView.body.case.files[1].name}`, token), token);
   const reprocessed = await request('POST', `/cases/${report.body.id}/evidence/${caseView.body.case.files[1].name}/reprocess`, null, token, { 'X-Original-Grant': videoRelease.body.grant });
   assert.equal(reprocessed.status, 200, JSON.stringify(reprocessed.body));
@@ -200,7 +217,7 @@ test('media derivatives mask images, video, text and speech while keeping encryp
   })));
   const formats = await request('POST', '/report-base64', { title: 'Additional media formats', description: 'Review copy formats', files: formatFiles });
   assert.equal(formats.status, 200, JSON.stringify(formats.body));
-  const formatView = await request('GET', `/cases/${formats.body.id}`, null, token);
+  const formatView = await waitForMedia(formats.body.id, token);
   for (const [index, [, , , expectedMime]] of additionalMedia.entries()) {
     const file = formatView.body.case.files[index];
     assert.equal(file.maskedCopyAvailable, true);

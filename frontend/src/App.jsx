@@ -1,14 +1,12 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import axios from "axios";
+import axios, { API, setToken } from './api';
+import { isCancel } from 'axios';
+import { EvidenceStatus, RecoveryReceipt, evidenceLabel, processingPending } from './SecurityStatus';
 import OriginalAccess, { ViewerAccount, AuditPhoto } from './ViewerAccess';
 import EvidenceCapture from "./EvidenceCapture";
+import CaseActions, { reviewerPermissions } from './CaseActions';
+import ReporterSafety from './ReporterSafety';
 import { evidenceError as validateEvidence, evidenceFileBase64, MAX_EVIDENCE_BYTES } from "./capture.mjs";
-
-const API =
-  window.SENTINELQ_CONFIG?.apiBaseUrl ||
-  (["localhost", "127.0.0.1"].includes(window.location.hostname)
-    ? "http://127.0.0.1:4000"
-    : window.location.origin);
 
 function checkPrivacy(text) {
   const warnings = [];
@@ -67,7 +65,7 @@ function NavIcon({ name }) {
 
 const GUIDE_STEPS = [
   { title: "Tell us what happened", short: "Describe your concern", icon: "report", heading: "Start with your own words.", text: "Give your report a short title, then explain what happened. Include the details a reviewer needs, at your own pace.", tip: "You don’t need an account. Leave out names or contact details that aren’t needed to understand the incident.", preview: "A short title and a clear description", note: "The privacy helper can flag some identifying details for you to review." },
-  { title: "Add evidence, if you have it", short: "Attach supporting files", icon: "upload", heading: "A little context can help.", text: "You can attach documents, photos, video or audio. Evidence is optional, so you can still send a report without files.", tip: "Check the contents and filenames before uploading. A document or photo can reveal more about you than you intend.", preview: "Supporting files · optional", note: "Original files are encrypted and restricted. Some formats remain quarantined." },
+  { title: "Add supporting evidence", short: "Attach supporting files", icon: "upload", heading: "A little context can help.", text: "You can attach documents, photos, video or audio. At least one supporting file is required before you can submit.", tip: "Check the contents and filenames before uploading. A document or photo can reveal more about you than you intend.", preview: "Supporting files · required", note: "Original files are encrypted and restricted. Some formats remain quarantined." },
   { title: "Save your case details", short: "Keep your recovery key", icon: "lock", heading: "Keep the way back to your case.", text: "After submission, you’ll receive a Case ID and a recovery key. Save both somewhere only you can access.", tip: "Your recovery key is shown after submission and cannot be reset. Anyone with both details can access your case.", preview: "Case ID + recovery key", note: "These details take the place of a reporter account and password." },
   { title: "Return for updates", short: "Follow your case", icon: "track", heading: "Stay part of the conversation.", text: "Use Track a case to see its status and any messages from the reviewing authority. You can also send a follow-up.", tip: "Keep your case details handy. You’ll need to return here to check for updates and reply to questions.", preview: "Case status and messages", note: "Submitting a report does not guarantee a particular outcome or response time." },
 ];
@@ -86,7 +84,7 @@ function GettingStarted({ onStart, onTrack }) {
             <button className="primary-action" onClick={onStart}>Start a report <NavIcon name="arrow" /></button>
             <button className="text-action" onClick={onTrack}>Already reported? Track your case <span aria-hidden="true">↗</span></button>
           </div>
-          <p className="welcome-caption"><NavIcon name="shield" /> No reporter account required · Supporting files are optional</p>
+          <p className="welcome-caption"><NavIcon name="shield" /> No reporter account required · Supporting evidence is required</p>
         </div>
         <aside className="before-you-begin">
           <span className="note-label">BEFORE YOU BEGIN</span>
@@ -119,6 +117,7 @@ function GettingStarted({ onStart, onTrack }) {
         <div><p className="section-eyebrow">GOOD TO KNOW</p><h2 id="help-heading">A little clarity<br /> before you share.</h2><p>You decide when you’re ready to begin.</p></div>
         <div className="help-questions">
           <details><summary>Do I need to share my identity?</summary><p>No reporter account is required. Avoid unnecessary identifying details in your title, description and files. The privacy helper is advisory; it cannot guarantee anonymity.</p></details>
+          <details><summary>How is my information encrypted?</summary><p>New reports use lattice-based post-quantum cryptography: ML-KEM-768 protects encryption keys, AES-256-GCM encrypts stored data, and ML-DSA-65 signs case records. Earlier records retain their original protection until updated. The platform manages these keys; this does not provide end-to-end encryption or hide your network activity.</p></details>
           <details><summary>Who can view my report and evidence?</summary><p>Case access is restricted to authorized reviewers. Original evidence requires an authorized court or admin account, that viewer’s personal key, and a recorded camera photo. Sensitive case details use a separate judicial access key. Messages are encrypted in storage, not end to end.</p></details>
           <details><summary>What if I need to leave quickly?</summary><p>Quick exit clears the current workspace and opens a blank page or the configured exit page. It does not erase browser history, downloaded files or network records. An unsent report will be lost.</p></details>
           <details><summary>How do I get back to my report?</summary><p>Choose Track a case and enter your Case ID and recovery key. Save both after submitting; a lost recovery key cannot be reset. You must return to the portal to check for messages.</p></details>
@@ -198,9 +197,10 @@ function CorrelationGraph({ verification, selectedCase }) {
       </div>
       <div className="correlation-graph">
         <svg viewBox="0 0 360 150" aria-label="Logical case correlation graph">
-          <path d="M180 75 L80 35 M180 75 L275 35 M180 75 L275 120" />
           {related.slice(0, 3).map((item, index) => (
             <g key={item.id}>
+              <title>{item.id}</title>
+              <path d={`M180 75 L${[80, 275, 275][index]} ${[35, 35, 120][index]}`} />
               <circle
                 className="graph-node related"
                 cx={[80, 275, 275][index]}
@@ -208,14 +208,14 @@ function CorrelationGraph({ verification, selectedCase }) {
                 r="18"
               />
               <text x={[80, 275, 275][index]} y={[35, 35, 120][index]}>
-                {item.id.replace("CASE-", "SQ-").slice(0, 8)}
+                {item.id.slice(-6)}
               </text>
             </g>
           ))}
           <circle className="graph-node main" cx="180" cy="75" r="25" />
           <text x="180" y="75">
             {selectedCase
-              ? selectedCase.id.replace("CASE-", "SQ-").slice(0, 8)
+              ? selectedCase.id.slice(-6)
               : "CASE"}
           </text>
         </svg>
@@ -238,33 +238,62 @@ function CaseTracker({ onPanicExit }) {
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
   const [sending, setSending] = useState(false);
+  const [securityBusy, setSecurityBusy] = useState(false), [securityNotice, setSecurityNotice] = useState('');
+  const trackGeneration = useRef(0);
+  const closeCase = () => { trackGeneration.current++; setTrackedCase(null); setRecoverySecret(''); setCaseId(''); setMessage(''); setError(''); setLoading(false); setSending(false); setSecurityBusy(false); };
+  useEffect(() => {
+    let lastActive = Date.now();
+    const activity = () => { lastActive = Date.now(); };
+    const timer = setInterval(() => { if (Date.now() - lastActive > 15 * 60 * 1000) closeCase(); }, 10000);
+    window.addEventListener('pointerdown', activity);
+    window.addEventListener('keydown', activity);
+    return () => { clearInterval(timer); trackGeneration.current++; window.removeEventListener('pointerdown', activity); window.removeEventListener('keydown', activity); };
+  }, []);
+  useEffect(() => {
+    if (!trackedCase || loading || sending || securityBusy) return;
+    let cancelled = false, busy = false;
+    const timer = setInterval(async () => {
+      if (document.hidden || busy) return;
+      busy = true;
+      try {
+        const response = await axios.post(`${API}/track`, { caseId: trackedCase.id, recoverySecret: recoverySecret.trim() });
+        if (!cancelled) setTrackedCase(response.data.case);
+      } catch (err) { if (!cancelled) setError(err.response?.data?.error || 'Progress could not refresh. Your submitted report is still saved.'); }
+      finally { busy = false; }
+    }, 10000);
+    return () => { cancelled = true; clearInterval(timer); };
+  }, [trackedCase?.id, recoverySecret, loading, sending, securityBusy]);
 
   const trackCase = async (event) => {
     event.preventDefault();
+    if (loading || sending || securityBusy) return;
     setError("");
     setLoading(true);
+    const generation = ++trackGeneration.current;
     try {
       const response = await axios.post(`${API}/track`, {
         caseId: caseId.trim(),
         recoverySecret: recoverySecret.trim(),
       });
-      setTrackedCase(response.data.case);
+      if (generation === trackGeneration.current) setTrackedCase(response.data.case);
     } catch (requestError) {
+      if (generation !== trackGeneration.current) return;
       setTrackedCase(null);
       setError(
         requestError.response?.data?.error ||
           "Could not open this case. Check the Case ID and recovery key.",
       );
     } finally {
-      setLoading(false);
+      if (generation === trackGeneration.current) setLoading(false);
     }
   };
 
   const sendReply = async (event) => {
     event.preventDefault();
-    if (!message.trim() || !trackedCase) return;
+    if (!message.trim() || !trackedCase || sending || loading || securityBusy) return;
     setSending(true);
     setError("");
+    const generation = trackGeneration.current;
     try {
       const response = await axios.post(
         `${API}/cases/${encodeURIComponent(trackedCase.id)}/messages`,
@@ -273,19 +302,29 @@ function CaseTracker({ onPanicExit }) {
           sender: "reporter",
           recoverySecret: recoverySecret.trim(),
         },
+        { headers: { Authorization: null } },
       );
-      setTrackedCase({
-        ...trackedCase,
-        messages: response.data.messages || [],
-      });
+      if (generation !== trackGeneration.current) return;
+      setTrackedCase(current => current ? { ...current, messages: response.data.messages || [] } : current);
       setMessage("");
     } catch (requestError) {
+      if (generation !== trackGeneration.current) return;
       setError(
         requestError.response?.data?.error || "Message could not be sent.",
       );
     } finally {
-      setSending(false);
+      if (generation === trackGeneration.current) setSending(false);
     }
+  };
+
+  const rotated = async newKey => {
+    const generation = ++trackGeneration.current;
+    setRecoverySecret(newKey);
+    setTrackedCase(current => current ? { ...current, reviewLocked: true } : current);
+    try {
+      const { data } = await axios.post(`${API}/track`, { caseId: trackedCase.id, recoverySecret: newKey });
+      if (generation === trackGeneration.current) setTrackedCase(data.case);
+    } catch { if (generation === trackGeneration.current) setError('Key replacement succeeded. Keep your saved new key and refresh when storage is available.'); }
   };
 
   return (
@@ -301,6 +340,7 @@ function CaseTracker({ onPanicExit }) {
         </button>
       </div>
       <section className="surface-panel tracker-panel">
+        {securityNotice && <p role="status">{securityNotice}</p>}
         <div className="panel-kicker">
           <span>CASE ACCESS</span>
           <span className="mono">NO ACCOUNT REQUIRED</span>
@@ -314,6 +354,10 @@ function CaseTracker({ onPanicExit }) {
             Case ID
             <input
               value={caseId}
+              maxLength={101}
+              autoComplete="off"
+              spellCheck={false}
+              readOnly={!!trackedCase}
               onChange={(event) => setCaseId(event.target.value)}
               placeholder="CASE-..."
               required
@@ -322,16 +366,19 @@ function CaseTracker({ onPanicExit }) {
           <label>
             Recovery key
             <input
+              type="password"
               value={recoverySecret}
+              readOnly={!!trackedCase}
               onChange={(event) => setRecoverySecret(event.target.value)}
               autoComplete="off"
               required
             />
           </label>
           {error && <p className="inline-warning" role="alert">{error}</p>}
-          <button className="primary-action" type="submit" disabled={loading}>
-            {loading ? "Opening case..." : "Open case"} <span>→</span>
+          <button className="primary-action" type="submit" disabled={loading || sending || securityBusy}>
+            {loading ? "Refreshing…" : trackedCase ? "Refresh case and messages" : "Open case"} <span>→</span>
           </button>
+          {trackedCase && <button className="text-action" type="button" onClick={closeCase}>Close case and clear key</button>}
         </form>
       </section>
       {trackedCase && (
@@ -342,6 +389,7 @@ function CaseTracker({ onPanicExit }) {
           </div>
           <h3>{trackedCase.title || "Untitled case"}</h3>
           <p>{trackedCase.description}</p>
+          <ReporterSafety key={trackedCase.id} record={trackedCase} recoverySecret={recoverySecret.trim()} onUpdated={setTrackedCase} onRotated={rotated} onBusy={setSecurityBusy} onDeleted={pending => { closeCase(); setSecurityBusy(false); setSecurityNotice(pending ? 'Complaint access is revoked. Removal of retired encrypted objects is pending and will retry automatically.' : 'Your live complaint, messages and evidence were deleted. Minimal audit and deletion records remain.'); }} />
           <div className="tracker-meta">
             <span>
               Category: <strong>{trackedCase.category}</strong>
@@ -355,6 +403,7 @@ function CaseTracker({ onPanicExit }) {
             </span>
           </div>
           <div className="tracker-timeline">
+            <EvidenceStatus files={trackedCase.files} />
             {(trackedCase.timeline || []).map((item) => (
               <div className="timeline-row" key={`${item.at}-${item.label}`}>
                 <StatusDot tone="cyan" />
@@ -377,7 +426,7 @@ function CaseTracker({ onPanicExit }) {
                 className={`chat-message ${item.sender === "reporter" ? "reporter" : ""}`}
                 key={item.id}
               >
-                <small>{item.sender}</small>
+                <small>{item.sender} · {item.createdAt ? new Date(item.createdAt).toLocaleString() : ''}</small>
                 <p>{item.text}</p>
               </div>
             ))}
@@ -388,12 +437,14 @@ function CaseTracker({ onPanicExit }) {
           <form onSubmit={sendReply} className="chat-form">
             <input
               value={message}
+              maxLength={4000}
+              disabled={sending}
               onChange={(event) => setMessage(event.target.value)}
               aria-label="Message to the reviewing authority"
               placeholder="Write a follow-up message"
               required
             />
-            <button className="primary-action" type="submit" disabled={sending}>
+            <button className="primary-action" type="submit" disabled={loading || sending || securityBusy || !message.trim()}>
               {sending ? "Sending..." : "Send"}
             </button>
           </form>
@@ -405,6 +456,7 @@ function CaseTracker({ onPanicExit }) {
 
 export default function App() {
   const [title, setTitle] = useState("");
+  const [location, setLocation] = useState(''), [incidentDate, setIncidentDate] = useState('');
   const [description, setDescription] = useState("");
   const [anonymizedDescription, setAnonymizedDescription] = useState("");
   const [files, setFiles] = useState([]);
@@ -416,9 +468,15 @@ export default function App() {
   const previousView = useRef("welcome");
   const [cases, setCases] = useState([]);
   const [caseSearch, setCaseSearch] = useState("");
+  const [statusFilter, setStatusFilter] = useState('All');
   const [selectedCase, setSelectedCase] = useState(null);
   const [caseLoading, setCaseLoading] = useState(false);
   const [caseError, setCaseError] = useState("");
+  const [detailLoading, setDetailLoading] = useState(false);
+  const [detailRefresh, setDetailRefresh] = useState(0);
+  const [messageError, setMessageError] = useState('');
+  const [verificationError, setVerificationError] = useState('');
+  const [auditError, setAuditError] = useState('');
   const [panicExit, setPanicExit] = useState(false);
   const [privacyWarnings, setPrivacyWarnings] = useState([]);
   const [chatMessages, setChatMessages] = useState([]);
@@ -426,6 +484,10 @@ export default function App() {
   const [chatSending, setChatSending] = useState(false);
   const [isAnonymizing, setIsAnonymizing] = useState(false);
   const [submitting, setSubmitting] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState(0);
+  const pendingSubmission = useRef(null);
+  const descriptionRevision = useRef(0);
+  const detailsGeneration = useRef(0);
   const [acceptedAnonymized, setAcceptedAnonymized] = useState(false);
   const [verification, setVerification] = useState(null);
   const [authority, setAuthority] = useState(null);
@@ -434,6 +496,11 @@ export default function App() {
     password: "",
   });
   const [loginError, setLoginError] = useState("");
+  const [loginBusy, setLoginBusy] = useState(false);
+  const authorityGeneration = useRef(0);
+  const selectedCaseRef = useRef(null);
+  selectedCaseRef.current = selectedCase?.id;
+  const permissions = reviewerPermissions(authority?.user?.role);
   const [auditEvents, setAuditEvents] = useState([]);
   const [originalAccessFile, setOriginalAccessFile] = useState(null);
   const [judicialKey, setJudicialKey] = useState("");
@@ -443,6 +510,36 @@ export default function App() {
   const [detailsFormOpen, setDetailsFormOpen] = useState(false);
   const [judicialDetails, setJudicialDetails] = useState(null);
   const [detailsError, setDetailsError] = useState("");
+  const clearAuthority = () => {
+    detailsGeneration.current++;
+    authorityGeneration.current++; setLoginBusy(false); setCaseError(''); setMessageError(''); setVerificationError(''); setAuditError(''); setCaseSearch(''); setStatusFilter('All');
+    setToken(null); setAuthority(null); setCases([]); setSelectedCase(null); setChatMessages([]); setChatInput(''); setAuditEvents([]); setVerification(null);
+    setOriginalAccessFile(null); setJudicialKey(''); setAccessReason(''); setJudicialDetails(null); setDetailsFormOpen(false); setLoginForm({ username: '', password: '' });
+  };
+  useEffect(() => {
+    const expire = () => { clearAuthority(); setLoginError('Your session ended. Sign in again to continue.'); };
+    window.addEventListener('sentinelq-session-expired', expire);
+    return () => window.removeEventListener('sentinelq-session-expired', expire);
+  }, []);
+  useEffect(() => {
+    const restored = event => { if (event.persisted) window.location.reload(); };
+    const leaving = () => { clearAuthority(); setResult(null); setTitle(''); setDescription(''); setFiles([]); setLocation(''); setIncidentDate(''); pendingSubmission.current = null; };
+    window.addEventListener('pagehide', leaving);
+    window.addEventListener('pageshow', restored);
+    return () => { window.removeEventListener('pagehide', leaving); window.removeEventListener('pageshow', restored); };
+  }, []);
+  useEffect(() => {
+    if (!authority) return;
+    let lastActive = Date.now();
+    const activity = () => { lastActive = Date.now(); };
+    const timer = setInterval(() => {
+      if (Date.now() - lastActive >= 15 * 60 * 1000 || Date.now() >= Date.parse(authority.expiresAt)) {
+        logout(); setLoginError('Locked after inactivity or session expiry. Sign in again to continue.');
+      }
+    }, 10000);
+    window.addEventListener('pointerdown', activity); window.addEventListener('keydown', activity);
+    return () => { clearInterval(timer); window.removeEventListener('pointerdown', activity); window.removeEventListener('keydown', activity); };
+  }, [authority]);
 
   useEffect(() => {
     const titles = { welcome: "Getting started", report: "Submit a report", track: "Track a case", dashboard: "Authority access" };
@@ -461,9 +558,7 @@ export default function App() {
   }, [result]);
 
   useEffect(() => {
-    if (authority?.token)
-      axios.defaults.headers.common.Authorization = `Bearer ${authority.token}`;
-    else delete axios.defaults.headers.common.Authorization;
+    setToken(authority?.token);
   }, [authority]);
 
   useEffect(() => {
@@ -471,15 +566,18 @@ export default function App() {
   }, [description]);
 
   const anonymize = async () => {
-    if (!description.trim()) return;
+    if (!description.trim() || isAnonymizing || submitting) return;
+    const revision = descriptionRevision.current;
     setIsAnonymizing(true);
     try {
       const res = await axios.post(`${API}/anonymize`, { text: description });
+      if (revision !== descriptionRevision.current) return;
       setAnonymizedDescription(res.data.anonymizedText || "");
       setAcceptedAnonymized(false);
-      setResult({ suggestion: res.data.anonymizedText });
+      if (!result?.recoverySecret) setResult({ suggestion: res.data.anonymizedText });
     } catch (err) {
-      setResult({ error: err.message });
+      if (revision !== descriptionRevision.current) return;
+      if (!result?.recoverySecret) setResult({ error: err.message });
     } finally {
       setIsAnonymizing(false);
     }
@@ -496,13 +594,15 @@ export default function App() {
 
   const submit = async (e) => {
     e.preventDefault();
-    if (submitting || captureBusy) return;
-    const error = validateEvidence(files);
+    if (submitting || captureBusy || isAnonymizing || result?.recoverySecret) return;
+    const error = files.length ? validateEvidence(files) : 'Attach at least one supporting evidence file before submitting.';
     if (error) { setAttachmentError(error); return; }
     setSubmitting(true);
+    setUploadProgress(0);
     try {
       const toSend = {
         title,
+        location, incidentDate,
         description: acceptedAnonymized ? anonymizedDescription : description,
         anonymizedDescription: acceptedAnonymized ? anonymizedDescription : "",
         files: [],
@@ -511,12 +611,17 @@ export default function App() {
         const b64 = await evidenceFileBase64(file);
         toSend.files.push({ name: file.name, data: b64 });
       }
-      const res = await axios.post(`${API}/report-base64`, toSend);
+      const digest = Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(JSON.stringify(toSend)))), byte => byte.toString(16).padStart(2, '0')).join('');
+      if (pendingSubmission.current?.digest !== digest) pendingSubmission.current = { digest, token: btoa(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(32)))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '') };
+      const res = await axios.post(`${API}/report-base64`, toSend, { headers: { 'X-Submission-Token': pendingSubmission.current.token }, onUploadProgress: progress => setUploadProgress(progress.total ? Math.min(100, Math.round(progress.loaded / progress.total * 100)) : 0) });
+      pendingSubmission.current = null;
       setResult({ ...res.data, flow: "Report submitted" });
+      descriptionRevision.current++;
+      setTitle(''); setDescription(''); setFiles([]); setLocation(''); setIncidentDate('');
       setAcceptedAnonymized(false);
       setAnonymizedDescription("");
     } catch (err) {
-      setResult({ error: err.response?.data?.error || err.message });
+      setResult({ error: err.response?.data?.error || 'Submission could not be confirmed. Keep this tab open and retry with the same details; a saved report will not be duplicated.' });
     } finally {
       setSubmitting(false);
     }
@@ -530,11 +635,10 @@ export default function App() {
       const res = await axios.get(`${API}/cases`);
       const nextCases = res.data.cases || [];
       setCases(nextCases);
-      if (!selectedCase && nextCases.length > 0) {
-        setSelectedCase(nextCases[0]);
-      }
+      setSelectedCase(current => nextCases.find(item => item.id === current?.id) || nextCases[0] || null);
+      setDetailRefresh(current => current + 1);
     } catch (err) {
-      setCaseError(err.message);
+      if (!isCancel(err)) setCaseError(err.response?.data?.error || 'Could not refresh cases. Try again.');
     } finally {
       setCaseLoading(false);
     }
@@ -542,32 +646,33 @@ export default function App() {
 
   const login = async (e) => {
     e.preventDefault();
+    if (loginBusy) return;
+    setLoginBusy(true);
+    const generation = ++authorityGeneration.current;
     setLoginError("");
     try {
       const res = await axios.post(`${API}/auth/login`, loginForm);
-      const session = { token: res.data.token, user: res.data.user };
+      if (generation !== authorityGeneration.current) return;
+      const session = { token: res.data.token, user: res.data.user, expiresAt: res.data.expiresAt };
+      setToken(session.token);
       setAuthority(session);
+      setLoginForm({ username: '', password: '' });
       setActiveView("dashboard");
     } catch (error) {
-      setLoginError(error.response?.data?.error || "Authority login failed");
-    }
+      if (generation === authorityGeneration.current) setLoginError(error.response?.data?.error || "Authority login failed");
+    } finally { if (generation === authorityGeneration.current) setLoginBusy(false); }
   };
 
   const logout = async () => {
+    const token = authority?.token;
+    clearAuthority();
+    pendingSubmission.current = null;
+    setActiveView("dashboard");
     try {
-      await axios.post(`${API}/auth/logout`);
+      if (token) await fetch(`${API}/auth/logout`, { method: 'POST', headers: { Authorization: `Bearer ${token}` }, keepalive: true });
     } catch (error) {
       /* local session still clears */
     }
-    setAuthority(null);
-    setJudicialKey("");
-    setAccessReason("");
-    setOriginalAccessFile(null);
-    setDetailsFormOpen(false);
-    setJudicialDetails(null);
-    setCases([]);
-    setSelectedCase(null);
-    setActiveView("report");
   };
 
   const downloadEvidence = async (file, grant = null) => {
@@ -593,17 +698,20 @@ export default function App() {
 
   const unlockJudicialDetails = async (event) => {
     event.preventDefault();
-    if (!selectedCase?.id) return;
+    if (!selectedCase?.id || evidenceBusy) return;
+    const id = selectedCase.id;
+    const generation = ++detailsGeneration.current;
     setDetailsError("");
     setEvidenceBusy(true);
     try {
       const response = await axios.post(`${API}/cases/${encodeURIComponent(selectedCase.id)}/judicial-details`, { key: judicialKey, reason: accessReason });
+      if (generation !== detailsGeneration.current || selectedCaseRef.current !== id || document.hidden) return;
       setJudicialDetails(response.data.details);
       setDetailsFormOpen(false);
       setAccessReason("");
       loadAudit();
     } catch (error) {
-      setDetailsError(error.response?.data?.error || "Judicial details unavailable");
+      if (generation === detailsGeneration.current && !isCancel(error)) setDetailsError(error.response?.data?.error || "Judicial details unavailable");
     } finally {
       setJudicialKey("");
       setEvidenceBusy(false);
@@ -612,43 +720,36 @@ export default function App() {
 
   const reprocessEvidence = async (file, grant) => {
     if (!selectedCase?.id) return;
+    const id = selectedCase.id;
     setEvidenceError("");
     setEvidenceBusy(true);
     try {
       const response = await axios.post(`${API}/cases/${encodeURIComponent(selectedCase.id)}/evidence/${encodeURIComponent(file.name)}/reprocess`, {}, { headers: { "X-Original-Grant": grant } });
+      if (selectedCaseRef.current !== id) return;
       setSelectedCase(response.data.case);
       setCases(previous => previous.map(item => item.id === response.data.case.id ? response.data.case : item));
       loadAudit();
     } catch (error) {
-      setEvidenceError(error.response?.data?.error || "Media processing failed");
+      if (selectedCaseRef.current === id && !isCancel(error)) setEvidenceError(error.response?.data?.error || "Media processing failed");
     } finally {
       setEvidenceBusy(false);
     }
   };
 
   const loadAudit = async () => {
-    if (!authority?.token) return;
+    if (!authority?.token || !permissions.audit) return;
+    setAuditError('');
     try {
       const res = await axios.get(`${API}/audit`);
       setAuditEvents(res.data.events || []);
     } catch (error) {
-      setAuditEvents([]);
-    }
-  };
-
-  const loadMessages = async (caseId) => {
-    if (!caseId) return;
-    try {
-      const res = await axios.get(
-        `${API}/cases/${encodeURIComponent(caseId)}/messages`,
-      );
-      setChatMessages(res.data.messages || []);
-    } catch (err) {
-      setChatMessages([]);
+      if (!isCancel(error)) setAuditError(error.response?.data?.error || 'Audit activity could not refresh.');
     }
   };
 
   useEffect(() => {
+    detailsGeneration.current++;
+    if (activeView !== 'dashboard') { setJudicialDetails(null); setDetailsFormOpen(false); setOriginalAccessFile(null); setJudicialKey(''); setAccessReason(''); }
     if (activeView === "dashboard" && authority?.token) {
       loadCases();
       loadAudit();
@@ -656,16 +757,56 @@ export default function App() {
   }, [activeView, authority?.token]);
 
   useEffect(() => {
-    if (activeView === "dashboard" && selectedCase?.id) {
-      loadMessages(selectedCase.id);
-      axios
-        .get(`${API}/cases/${encodeURIComponent(selectedCase.id)}/verification`)
-        .then((res) => setVerification(res.data.verification || null))
-        .catch(() => setVerification(null));
-    }
-  }, [activeView, selectedCase?.id]);
+    if (activeView !== 'dashboard' || !authority || !selectedCase?.id) return;
+    let cancelled = false;
+    const id = selectedCase.id;
+    setChatMessages([]); setChatInput(''); setMessageError(''); setVerification(null); setVerificationError(''); setDetailLoading(true);
+    axios.get(`${API}/cases/${encodeURIComponent(id)}`).then(({ data }) => {
+      if (cancelled) return;
+      setSelectedCase(data.case); setChatMessages(data.case.messages || []);
+    }).catch(error => { if (!cancelled && !isCancel(error)) setCaseError(error.response?.data?.error || 'Case details could not load. Refresh data to retry.'); })
+      .finally(() => { if (!cancelled) setDetailLoading(false); });
+    axios.get(`${API}/cases/${encodeURIComponent(id)}/verification`).then(({ data }) => { if (!cancelled) setVerification(data.verification || null); })
+      .catch(error => { if (!cancelled && !isCancel(error)) setVerificationError(error.response?.data?.error || 'Integrity checks could not load. Refresh data to retry.'); });
+    return () => { cancelled = true; };
+  }, [activeView, authority?.token, selectedCase?.id, detailRefresh]);
 
   useEffect(() => {
+    if (!authority || activeView !== 'dashboard' || !processingPending(selectedCase?.files)) return;
+    let cancelled = false, busy = false;
+    const timer = setInterval(async () => {
+      if (document.hidden || busy) return;
+      busy = true;
+      try {
+        const { data } = await axios.get(`${API}/cases/${encodeURIComponent(selectedCase.id)}`);
+        if (cancelled) return;
+        setSelectedCase(data.case);
+        setCases(current => current.map(item => item.id === data.case.id ? data.case : item));
+        const checked = await axios.get(`${API}/cases/${encodeURIComponent(selectedCase.id)}/verification`);
+        if (!cancelled) setVerification(checked.data.verification);
+      } catch (error) { if (!cancelled) setEvidenceError(error.response?.data?.error || 'Could not refresh evidence status.'); }
+      finally { busy = false; }
+    }, 5000);
+    return () => { cancelled = true; clearInterval(timer); };
+  }, [activeView, authority?.token, selectedCase?.id, processingPending(selectedCase?.files)]);
+
+  useEffect(() => {
+    if (!result?.recoverySecret || !processingPending(result.files)) return;
+    let cancelled = false, busy = false;
+    const timer = setInterval(async () => {
+      if (document.hidden || busy) return;
+      busy = true;
+      try {
+        const { data } = await axios.post(`${API}/track`, { caseId: result.id, recoverySecret: result.recoverySecret });
+        if (!cancelled) setResult(current => current?.id === result.id ? { ...current, files: data.case.files } : current);
+      } catch { /* Receipt remains valid during a temporary refresh failure. */ }
+      finally { busy = false; }
+    }, 15000);
+    return () => { cancelled = true; clearInterval(timer); };
+  }, [result?.id, processingPending(result?.files)]);
+
+  useEffect(() => {
+    detailsGeneration.current++;
     setOriginalAccessFile(null);
     setJudicialKey("");
     setAccessReason("");
@@ -676,16 +817,17 @@ export default function App() {
   }, [selectedCase?.id]);
 
   useEffect(() => {
-    if (!judicialDetails) return;
+    if (!judicialDetails && !detailsFormOpen) return;
     const timer = setTimeout(() => setJudicialDetails(null), 60000);
-    return () => clearTimeout(timer);
-  }, [judicialDetails]);
+    const hide = () => { if (document.hidden) { detailsGeneration.current++; setJudicialDetails(null); setDetailsFormOpen(false); setJudicialKey(''); setAccessReason(''); } };
+    document.addEventListener('visibilitychange', hide);
+    return () => { clearTimeout(timer); document.removeEventListener('visibilitychange', hide); };
+  }, [judicialDetails, detailsFormOpen]);
 
   const filteredCases = useMemo(() => {
     const q = caseSearch.trim().toLowerCase();
-    if (!q) return cases;
     return cases.filter((item) => {
-      return [
+      return (statusFilter === 'All' || item.status === statusFilter) && [
         item.id,
         item.title,
         item.description,
@@ -697,110 +839,33 @@ export default function App() {
         .toLowerCase()
         .includes(q);
     });
-  }, [cases, caseSearch]);
-
-  const updateCase = async (caseId, status, priority) => {
-    try {
-      const res = await axios.post(
-        `${API}/cases/${encodeURIComponent(caseId)}/status`,
-        { status, priority },
-      );
-      const updatedCase = res.data.case;
-      setCases((prev) =>
-        prev.map((item) => (item.id === updatedCase.id ? updatedCase : item)),
-      );
-      setSelectedCase(updatedCase);
-      setResult({
-        updatedCase: updatedCase.id,
-        status: updatedCase.status,
-        priority: updatedCase.priority,
-      });
-    } catch (err) {
-      setResult({ error: err.message });
-    }
-  };
+  }, [cases, caseSearch, statusFilter]);
 
   const sendMessage = async (e) => {
     e.preventDefault();
-    if (!selectedCase || !chatInput.trim()) return;
+    if (!selectedCase || !chatInput.trim() || chatSending || !permissions.writeChat) return;
+    const id = selectedCase.id;
+    setMessageError('');
     setChatSending(true);
     try {
       const res = await axios.post(
         `${API}/cases/${encodeURIComponent(selectedCase.id)}/messages`,
         { text: chatInput.trim(), sender: "authority" },
       );
+      if (selectedCaseRef.current !== id) return;
       setChatMessages(res.data.messages || []);
       setChatInput("");
     } catch (err) {
-      setResult({ error: err.message });
+      if (selectedCaseRef.current === id && !isCancel(err)) setMessageError(err.response?.data?.error || 'Message could not be sent. Please retry.');
     } finally {
       setChatSending(false);
     }
   };
 
-  const exportSummary = async () => {
-    if (!selectedCase?.id) return;
-    try {
-      const res = await axios.get(
-        `${API}/cases/${encodeURIComponent(selectedCase.id)}/summary`,
-      );
-      setResult({ exportedSummary: res.data.summary });
-    } catch (err) {
-      setResult({ error: err.message });
-    }
-  };
-
-  const progressSteps = [
-    { title: "Complaint filed", completed: Boolean(title && description) },
-    {
-      title: "Identity protected",
-      completed: Boolean(acceptedAnonymized || anonymizedDescription),
-    },
-    { title: "Evidence secured", completed: files.length > 0 },
-    {
-      title: "Authority review",
-      completed: Boolean(selectedCase || result?.flow),
-    },
-  ];
-
-  const caseTimeline = selectedCase
-    ? [
-        {
-          label: "Complaint received",
-          detail: `Case ${selectedCase.id} opened and logged.`,
-        },
-        {
-          label: "Privacy review",
-          detail: "AI Privacy Guardian evaluated the original report text.",
-        },
-        {
-          label: "Evidence vault",
-          detail: `${selectedCase.files?.length || 0} evidence item(s) protected and hashed.`,
-        },
-        {
-          label: selectedCase.status,
-          detail: `Authority status set to ${selectedCase.status}.`,
-        },
-      ]
-    : [];
-
-  const liveFeed = [
-    {
-      label: "New complaint received",
-      detail: "An incident was safely submitted and anonymized.",
-    },
-    {
-      label: "Evidence secured",
-      detail: "Metadata stripped and encrypted evidence stored in the vault.",
-    },
-    {
-      label: "Case updated",
-      detail: "Authority review status advanced to In Review.",
-    },
-  ];
-
   const triggerPanicExit = () => {
     const token = authority?.token;
+    clearAuthority();
+    pendingSubmission.current = null;
     if (token)
       fetch(`${API}/auth/logout`, {
         method: "POST",
@@ -809,6 +874,7 @@ export default function App() {
       }).catch(() => {});
     setTitle("");
     setDescription("");
+    setLocation(''); setIncidentDate('');
     setAnonymizedDescription("");
     setFiles([]);
     setResult(null);
@@ -854,7 +920,7 @@ export default function App() {
       tone: "cyan",
     },
     {
-      label: "Integrity alerts",
+      label: "Masking alerts",
       value: cases.filter((item) =>
         item.files?.some((file) => file.processingStatus === "FAILED" || file.processingStatus === "NEEDS_MASKING"),
       ).length,
@@ -872,7 +938,7 @@ export default function App() {
   return (
     <div className="app-shell">
       <a className="skip-link" href="#workspace">Skip to workspace</a>
-      <div className="service-strip"><div><span>Independent incident reporting</span><span className="prototype-label">Prototype · Not a government service</span></div></div>
+      <div className="service-strip"><div><span>Independent incident reporting · Version 2</span><span className="prototype-label">Prototype · Not a government service</span></div></div>
       <header className="system-bar">
         <button className="brand-mark" onClick={() => setActiveView("welcome")} aria-label="SentinelQ home">
           <span className="brand-symbol"><NavIcon name="shield" /></span>
@@ -892,6 +958,7 @@ export default function App() {
             <><span className="session-avatar"><NavIcon name="lock" /></span><span>No account required<small>Access your case with a recovery key</small></span></>
           )}
         </div>
+        {authority && <button className="text-action header-signout" onClick={logout}>Sign out</button>}
         <button className="panic-link" onClick={triggerPanicExit} title="Clears this workspace and leaves the page. Browser history is not erased.">Quick exit <span aria-hidden="true">↗</span></button>
       </header>
       <div className="workspace-shell">
@@ -933,11 +1000,6 @@ export default function App() {
               <span>{authority ? "Case operations" : "Authority sign in"}</span>
             </button>
           </div>
-          {authority && <div className="sidebar-footer">
-              <button className="logout-link" onClick={logout}>
-                Sign out
-              </button>
-          </div>}
         </nav>
         <main ref={workspaceRef} className="main-workspace" id="workspace" tabIndex={-1}>
           {activeView === "welcome" && <GettingStarted onStart={() => setActiveView("report")} onTrack={() => setActiveView("track")} />}
@@ -955,7 +1017,7 @@ export default function App() {
                 <button className="text-action" onClick={() => setActiveView("welcome")}><NavIcon name="info" /> How it works</button>
               </div>
               <div className="report-layout"><div className="report-main">
-              <nav className="intake-steps" aria-label="Report sections"><a href="#report-details"><b>1</b> Incident details</a><a href="#report-evidence"><b>2</b> Evidence <small>Optional</small></a><a href="#report-submit"><b>3</b> Submit report</a></nav>
+              <nav className="intake-steps" aria-label="Report sections"><a href="#report-details"><b>1</b> Incident details</a><a href="#report-evidence"><b>2</b> Evidence <small>Required</small></a><a href="#report-submit"><b>3</b> Submit report</a></nav>
               <div className="intake-grid">
                 <section id="report-details" tabIndex={-1} className="intake-panel surface-panel">
                   <div className="panel-kicker">
@@ -969,6 +1031,8 @@ export default function App() {
                       Case title <span className="required-label">Required</span>
                       <input
                         value={title}
+                        maxLength={200}
+                        disabled={submitting}
                         onChange={(e) => setTitle(e.target.value)}
                         placeholder="A short summary of the concern"
                         required
@@ -978,12 +1042,17 @@ export default function App() {
                         Incident description <span className="required-label">Required</span>
                       <textarea
                         value={description}
-                        onChange={(e) => setDescription(e.target.value)}
-                        placeholder="Describe what happened, when, and where. Avoid details that identify you unless investigators need them."
+                        maxLength={10000}
+                        disabled={submitting}
+                        onChange={(e) => { descriptionRevision.current++; setDescription(e.target.value); setAnonymizedDescription(''); setAcceptedAnonymized(false); }}
+                        placeholder="Describe what happened. Use the encrypted location field below for an exact address or coordinates."
                         required
                       />
                     </label>
-                    <div className="field-hint"><span>Include what, when, and where. Avoid unnecessary personal details.</span><span>{description.length.toLocaleString()} characters</span></div>
+                    <div className="field-hint"><span>Keep exact location out of the title and narrative; use the protected field below.</span><span>{description.length.toLocaleString()} characters</span></div>
+                    <label>Incident date (optional)<input type="date" value={incidentDate} disabled={submitting} onChange={event => setIncidentDate(event.target.value)} /></label>
+                    <label>Exact location (optional, encrypted)<textarea value={location} disabled={submitting} onChange={event => setLocation(event.target.value)} maxLength={500} placeholder="Incident address, landmark or coordinates" /></label>
+                    <p className="field-hint">Ordinary views never receive this location. An authorized admin or court viewer needs the separate judicial key and an access reason to decrypt it. Your device location is not collected automatically.</p>
                     {privacyWarnings.length > 0 && (
                       <div className="privacy-analysis">
                         <div className="analysis-head">
@@ -1006,7 +1075,7 @@ export default function App() {
                           <button
                             type="button"
                             onClick={anonymize}
-                            disabled={isAnonymizing}
+                            disabled={isAnonymizing || submitting}
                           >
                             {isAnonymizing
                               ? "Scanning..."
@@ -1029,6 +1098,8 @@ export default function App() {
                         </div>
                         <textarea
                           aria-label="Suggested safer version"
+                          maxLength={10000}
+                          disabled={submitting}
                           value={anonymizedDescription}
                           onChange={(e) =>
                             setAnonymizedDescription(e.target.value)
@@ -1039,12 +1110,14 @@ export default function App() {
                           <button
                             type="button"
                             onClick={() => setAcceptedAnonymized(true)}
+                            disabled={submitting || !anonymizedDescription.trim()}
                           >
                             Apply redaction
                           </button>
                           <button
                             type="button"
                             onClick={() => setAcceptedAnonymized(false)}
+                            disabled={submitting}
                           >
                             Keep original
                           </button>
@@ -1059,9 +1132,11 @@ export default function App() {
                 <section id="report-evidence" tabIndex={-1} className="evidence-upload surface-panel">
                   <div className="panel-kicker">
                     <span>02 / SUPPORTING EVIDENCE</span>
-                    <span className="mono">OPTIONAL</span>
+                    <span className="mono">REQUIRED</span>
                   </div>
                   <h2 className="panel-title">Add supporting evidence.</h2>
+                  <p>At least one nonempty supporting file is required. Its integrity can be checked cryptographically; investigators must still assess whether the allegation is true.</p>
+                  <p className="security-notice">Submit without waiting for video masking. Once upload and encrypted storage finish, you receive your case details. Masking continues in the background; originals remain restricted.</p>
                   <EvidenceCapture onAdd={addEvidence} onBusy={setCaptureBusy} disabled={submitting || files.length >= 5} remainingBytes={MAX_EVIDENCE_BYTES - files.reduce((sum, file) => sum + file.size, 0)} />
                   <label className="drop-zone">
                     <span className="drop-icon"><NavIcon name="upload" /></span>
@@ -1109,7 +1184,8 @@ export default function App() {
                         ))}
                     </div>
                   )}
-                  <div id="report-submit" tabIndex={-1} className="submission-actions"><p>Ready to send your report?<small>{captureBusy ? "Use or discard your capture before submitting." : "Review your details above before submitting."}</small></p><button className="primary-action" type="submit" form="incident-report" disabled={submitting || captureBusy}>{submitting ? "Submitting..." : "Submit report"}<span aria-hidden="true">→</span></button></div>
+                  <div id="report-submit" tabIndex={-1} className="submission-actions"><p>Ready to send your report?<small>{result?.recoverySecret ? 'Save and clear the receipt below before submitting another report.' : captureBusy ? "Use or discard your capture before submitting." : "Review your details above before submitting."}</small></p><button className="primary-action" type="submit" form="incident-report" disabled={submitting || captureBusy || isAnonymizing || !files.length || Boolean(result?.recoverySecret)}>{submitting ? uploadProgress < 100 ? `Uploading ${uploadProgress}%` : "Saving securely…" : "Submit report"}<span aria-hidden="true">→</span></button></div>
+                  {submitting && <p role="status">{uploadProgress < 100 ? 'Uploading your report and attachments. Keep this page open until you receive your receipt.' : 'Upload complete. Waiting for confirmation that your encrypted report is saved.'} Masking will run afterward.</p>}
                   <p className="form-footnote"><NavIcon name="shield" />Save the recovery key shown after submission. You will need it to return to your case; it cannot be reset.</p>
                 </section>
                 {result && (
@@ -1122,7 +1198,7 @@ export default function App() {
                       <strong className={`result-title ${result.error ? "inline-warning" : ""}`}>
                         {result.error ? "Request could not be completed" : result.flow || "Response received"}
                       </strong>
-                      {result.error ? <p className="response-error">{result.error}</p> : result.recoverySecret ? <div className="report-receipt"><p>Your report has been received. Keep both details below in a safe place.</p><dl><dt>Case ID</dt><dd>{result.id}</dd><dt>Recovery key</dt><dd>{result.recoverySecret}</dd></dl><p className="disclaimer">{result.warning || "This key cannot be recovered if lost."}</p></div> : result.suggestion ? <p>Review the suggested version in the incident details before applying it.</p> : <p>Your request was completed.</p>}
+                      {result.error ? <p className="response-error">{result.error}</p> : result.recoverySecret ? <RecoveryReceipt key={result.id} result={result} onClose={() => setResult(null)} /> : result.suggestion ? <p>Review the suggested version in the incident details before applying it.</p> : <p>Your request was completed.</p>}
                     </>
                   </div>
                 )}
@@ -1142,6 +1218,7 @@ export default function App() {
                     Case records and masked evidence require an authenticated
                     session. Original viewing requires a court or admin account, a personal access key, and a camera photo.
                   </p>
+                  <p className="security-notice">This workspace locks after 15 minutes without keyboard or pointer activity. Sign out when finished on a shared device.</p>
                   <label>
                     Username
                     <input
@@ -1168,8 +1245,8 @@ export default function App() {
                   {loginError && (
                     <div className="inline-warning" role="alert">{loginError}</div>
                   )}
-                  <button className="primary-action" type="submit">
-                    Sign in <span>→</span>
+                  <button className="primary-action" type="submit" disabled={loginBusy}>
+                    {loginBusy ? 'Signing in…' : 'Sign in'} <span>→</span>
                   </button>
                 </form>
               ) : (
@@ -1182,14 +1259,16 @@ export default function App() {
                     />
                     <button
                       className="quiet-button"
+                      disabled={caseLoading || detailLoading}
                       onClick={() => {
                         loadCases();
                         loadAudit();
                       }}
                     >
-                      Refresh data
+                      {caseLoading || detailLoading ? 'Refreshing…' : 'Refresh data'}
                     </button>
                   </div>
+                  {caseError && <p className="inline-warning" role="alert">{caseError}</p>}
                   {['ADMIN', 'COURT'].includes(authority.user.role) && <ViewerAccount api={API} authority={authority} />}
                   <div className="metric-strip">
                     {metrics.map((metric) => (
@@ -1203,7 +1282,7 @@ export default function App() {
                   <div className="command-grid">
                     <div className="case-queue surface-panel">
                       <div className="panel-kicker">
-                        <span>ACTIVE CASE QUEUE</span>
+                        <span>CASE QUEUE · {filteredCases.length} OF {cases.length}</span>
                         <label className="compact-search">
                           <input
                             aria-label="Filter cases"
@@ -1213,6 +1292,7 @@ export default function App() {
                           />
                         </label>
                       </div>
+                      <label className="queue-filter">Filter by status<select value={statusFilter} onChange={e => setStatusFilter(e.target.value)}>{['All', 'Open', 'In Review', 'Closed'].map(value => <option key={value}>{value}</option>)}</select></label>
                       {caseLoading && (
                         <p className="muted">Loading secure queue...</p>
                       )}
@@ -1223,7 +1303,7 @@ export default function App() {
                           onClick={() => setSelectedCase(item)}
                         >
                           <div>
-                            <strong>{item.id.replace("CASE-", "SQ-")}</strong>
+                            <strong>{item.id}</strong>
                             <span>
                               {item.category} / {item.priority}
                             </span>
@@ -1239,11 +1319,12 @@ export default function App() {
                       ))}
                       {!caseLoading && filteredCases.length === 0 && (
                         <p className="empty-state">
-                          No cases match the current queue filter.
+                          {cases.length ? 'No cases match your filters.' : authority.user.role === 'INVESTIGATOR' ? 'No cases are assigned to you yet.' : 'No reports have been submitted yet.'}
                         </p>
                       )}
                     </div>
                     <div className="command-side">
+                      {verificationError && <p className="inline-warning" role="alert">{verificationError}</p>}
                       <VerificationMatrix verification={verification} />
                       <CorrelationGraph
                         verification={verification}
@@ -1251,12 +1332,13 @@ export default function App() {
                       />
                     </div>
                   </div>
-                  {selectedCase && (
+                  {detailLoading && <p role="status">Loading case details…</p>}
+                  {selectedCase && !detailLoading && (
                     <div className="case-workspace">
                       <div className="case-header">
                         <div>
                           <span className="mono">
-                            {selectedCase.id.replace("CASE-", "SQ-")}
+                            {selectedCase.id}
                           </span>
                           <h3>{selectedCase.title || "Untitled case"}</h3>
                         </div>
@@ -1274,6 +1356,7 @@ export default function App() {
                         </div>
                       </div>
                       <div className="case-content">
+                        <p className="muted">Location: {selectedCase.location || 'Not provided'}</p>
                         <div className="case-overview">
                           <p className="case-description">
                             {selectedCase.description || "No description."}
@@ -1282,7 +1365,7 @@ export default function App() {
                             <div className="judicial-panel">
                               <div className="panel-kicker"><span>RESTRICTED CASE DETAILS</span><span>JUDICIAL KEY REQUIRED</span></div>
                               <p className="muted">Reporter identifiers, source text, and original filenames stay masked during routine review.</p>
-                              <div className="evidence-actions"><button type="button" onClick={() => { setDetailsFormOpen(judicialDetails ? false : !detailsFormOpen); setJudicialDetails(null); setOriginalAccessFile(null); setJudicialKey(""); setAccessReason(""); setDetailsError(""); }}>{judicialDetails ? "Hide details" : detailsFormOpen ? "Cancel" : "Unlock sensitive details"}</button></div>
+                              <div className="evidence-actions"><button type="button" onClick={() => { detailsGeneration.current++; setDetailsFormOpen(judicialDetails ? false : !detailsFormOpen); setJudicialDetails(null); setOriginalAccessFile(null); setJudicialKey(""); setAccessReason(""); setDetailsError(""); }}>{judicialDetails ? "Hide details" : detailsFormOpen ? "Cancel" : "Unlock sensitive details"}</button></div>
                               {detailsError && <p className="inline-warning" role="alert">{detailsError}</p>}
                               {detailsFormOpen && (
                                 <form className="original-access-form" onSubmit={unlockJudicialDetails}>
@@ -1294,47 +1377,18 @@ export default function App() {
                               {judicialDetails && (
                                 <div className="judicial-details" role="region" aria-label="Unlocked judicial details">
                                   <p>Access audited. These details clear from this screen after 60 seconds.</p>
-                                  <dl><dt>Reporter reference</dt><dd>{judicialDetails.reporterId || "Not recorded"}</dd><dt>Original title</dt><dd>{judicialDetails.title || "Not recorded"}</dd><dt>Original report</dt><dd>{judicialDetails.description || "Not recorded"}</dd><dt>Involved</dt><dd>{judicialDetails.involved || "Not recorded"}</dd><dt>Incident date</dt><dd>{judicialDetails.incidentDate || "Not recorded"}</dd></dl>
+                                  <dl><dt>Exact location (decrypted)</dt><dd>{judicialDetails.location || "Not provided"}</dd><dt>Reporter reference</dt><dd>{judicialDetails.reporterId || "Not recorded"}</dd><dt>Original title</dt><dd>{judicialDetails.title || "Not recorded"}</dd><dt>Original report</dt><dd>{judicialDetails.description || "Not recorded"}</dd><dt>Involved</dt><dd>{judicialDetails.involved || "Not recorded"}</dd><dt>Incident date</dt><dd>{judicialDetails.incidentDate || "Not recorded"}</dd></dl>
                                   <strong>Original evidence metadata</strong>
                                   {judicialDetails.files?.map(file => <p key={file.id}>{file.originalName} · SHA3-256 {file.originalHash}</p>)}
                                 </div>
                               )}
                             </div>
                           )}
-                          <div className="status-actions">
-                            <button
-                              onClick={() =>
-                                updateCase(
-                                  selectedCase.id,
-                                  "Open",
-                                  selectedCase.priority,
-                                )
-                              }
-                            >
-                              Open
-                            </button>
-                            <button
-                              onClick={() =>
-                                updateCase(selectedCase.id, "In Review", "High")
-                              }
-                            >
-                              Mark in review
-                            </button>
-                            <button
-                              onClick={() =>
-                                updateCase(
-                                  selectedCase.id,
-                                  "Closed",
-                                  selectedCase.priority,
-                                )
-                              }
-                            >
-                              Close
-                            </button>
-                            <button onClick={exportSummary}>
-                              Export summary
-                            </button>
-                          </div>
+                          <CaseActions key={selectedCase.id} record={selectedCase} role={authority.user.role} onUpdated={updated => {
+                            setCases(current => current.map(item => item.id === updated.id ? { ...item, ...updated } : item));
+                            setSelectedCase(current => current?.id === updated.id ? { ...current, ...updated } : current);
+                            loadAudit();
+                          }} />
                           <div className="evidence-list">
                             <div className="panel-kicker">
                               <span>EVIDENCE CUSTODY</span>
@@ -1353,7 +1407,7 @@ export default function App() {
                                     bytes
                                   </span>
                                 </div>
-                                <small>{file.maskedCopyAvailable ? "Masked copy ready" : file.processingStatus === "QUARANTINED" ? "Quarantined" : "Masking required"}</small>
+                                <small aria-live="polite">{evidenceLabel(file)}</small>
                                 <small>{file.originalProtection === "COURT_SEALED" ? "Legacy sealed original: recovery required" : "Original restricted: personal key + viewer photo"}</small>
                                 {(file.mime?.startsWith("image/") || file.mime?.startsWith("video/") || file.mime?.startsWith("audio/")) && (
                                   <b
@@ -1374,17 +1428,17 @@ export default function App() {
                                 )}
                                 <div className="evidence-actions">
                                   {file.maskedCopyAvailable && <button type="button" onClick={() => downloadEvidence(file).catch(error => setEvidenceError(error.response?.data?.error || "Masked copy unavailable"))}>Download masked copy</button>}
-                                  {["ADMIN", "COURT"].includes(authority?.user?.role) && <button type="button" onClick={() => { setOriginalAccessFile(file.name); setDetailsFormOpen(false); setJudicialDetails(null); setJudicialKey(""); setAccessReason(""); setEvidenceError(""); }}>Request original</button>}
+                                  {["ADMIN", "COURT"].includes(authority?.user?.role) && <button type="button" onClick={() => { detailsGeneration.current++; setOriginalAccessFile(file.name); setDetailsFormOpen(false); setJudicialDetails(null); setJudicialKey(""); setAccessReason(""); setEvidenceError(""); }}>Request original</button>}
                                 </div>
                                 {["ADMIN", "COURT"].includes(authority?.user?.role) && originalAccessFile === file.name && <OriginalAccess key={`${selectedCase.id}:${file.name}`} api={API} caseId={selectedCase.id} file={file} authority={authority} onClose={() => setOriginalAccessFile(null)} onAudit={loadAudit} onReprocess={reprocessEvidence} />}
                               </div>
                             ))}
                           </div>
                         </div>
-                        <div className="chat-panel surface-panel">
+                        {permissions.readChat && <div className="chat-panel surface-panel">
                           <div className="panel-kicker">
                             <span>SECURE CASE CHANNEL</span>
-                            <span>IDENTITY SHIELDED</span>
+                            <span>ENCRYPTED AT REST</span>
                           </div>
                           <div className="chat-list">
                             {chatMessages.length === 0 ? (
@@ -1409,30 +1463,34 @@ export default function App() {
                               ))
                             )}
                           </div>
-                          <form onSubmit={sendMessage} className="chat-form">
+                          {messageError && <p className="inline-warning" role="alert">{messageError}</p>}
+                          {permissions.writeChat && <form onSubmit={sendMessage} className="chat-form">
                             <textarea
                               aria-label="Message to the reporter"
+                              maxLength={4000}
+                              disabled={chatSending}
                               value={chatInput}
                               onChange={(e) => setChatInput(e.target.value)}
                               placeholder="Send a case-scoped follow-up"
                             />
-                            <button type="submit" disabled={chatSending}>
+                            <button type="submit" disabled={chatSending || !chatInput.trim()}>
                               {chatSending ? "Sending..." : "Send message"}
                             </button>
-                          </form>
+                          </form>}
                           <small className="chat-footnote">
                             Encrypted at rest · Case-scoped communication · Not
                             end-to-end encrypted
                           </small>
-                        </div>
+                        </div>}
                       </div>
                     </div>
                   )}
-                  <div className="audit-stream surface-panel">
+                  {permissions.audit && <div className="audit-stream surface-panel">
                     <div className="panel-kicker">
                       <span>RECENT AUDIT ACTIVITY</span>
                       <span className="mono">REDACTED EVENTS</span>
                     </div>
+                    {auditError && <p className="inline-warning" role="alert">{auditError}</p>}
                     {auditEvents
                       .slice(-6)
                       .reverse()
@@ -1451,12 +1509,12 @@ export default function App() {
                           {event.event === 'ORIGINAL_ACCESS_GRANTED' && event.accessId && <AuditPhoto api={API} event={event} token={authority.token} />}
                         </div>
                       ))}
-                    {auditEvents.length === 0 && (
+                    {!auditError && auditEvents.length === 0 && (
                       <p className="empty-state">
                         No audit events available for this session.
                       </p>
                     )}
-                  </div>
+                  </div>}
                 </>
               )}
             </>

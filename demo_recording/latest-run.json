@@ -1,0 +1,24 @@
+{
+  "runId": "2026-10-09T02-15-23-403Z-recording",
+  "recording": "recordings\\2026-10-09T02-15-23-403Z-recording\\application_demo.mp4",
+  "verification": "recordings\\2026-10-09T02-15-23-403Z-recording\\workflow-verification.json",
+  "timeline": "recordings\\2026-10-09T02-15-23-403Z-recording\\timeline.json",
+  "metadata": {
+    "programs": [],
+    "stream_groups": [],
+    "streams": [
+      {
+        "codec_name": "h264",
+        "codec_type": "video",
+        "width": 1920,
+        "height": 1080,
+        "pix_fmt": "yuv420p",
+        "r_frame_rate": "30/1"
+      }
+    ],
+    "format": {
+      "duration": "287.466016",
+      "size": "19724481"
+    }
+  }
+}

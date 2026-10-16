@@ -76,7 +76,7 @@ test('anonymization and chat endpoints work', async (t) => {
   await waitForServer();
   const intake = await request('GET', '/evidence-intake');
   assert.equal(intake.statusCode, 200);
-  assert.deepEqual(intake.body, { ok: true, ready: true });
+  assert.deepEqual(intake.body, { ok: true, ready: true, evidenceRequired: true });
 
   const login = await request('POST', '/auth/login', { username: 'admin', password: TEST_ADMIN_PASSWORD });
   assert.equal(login.statusCode, 200);
@@ -90,7 +90,7 @@ test('anonymization and chat endpoints work', async (t) => {
   const report = await request('POST', '/report-base64', {
     title: 'Unsafe conduct',
     description: 'My name is Chris and I work at the downtown branch.',
-    files: []
+    files: [{ name: 'supporting-proof.txt', data: Buffer.from('Synthetic supporting evidence for this test.').toString('base64') }]
   });
   assert.equal(report.statusCode, 200);
   assert.match(report.body.id, /^CASE-/);
@@ -111,7 +111,7 @@ test('anonymization and chat endpoints work', async (t) => {
     files: [{ name: 'incident.mp4', data: Buffer.concat([Buffer.alloc(4), Buffer.from('ftyp'), Buffer.from('test-video-payload')]).toString('base64') }]
   });
   assert.equal(video.statusCode, 200);
-  assert.equal(video.body.files[0].processingStatus, 'FAILED');
+  assert.equal(video.body.files[0].processingStatus, 'QUEUED');
   assert.ok(video.body.files[0].originalArtifact);
   assert.equal(video.body.files[0].sanitizedHash, null);
   const originalDenied = await request('GET', `/cases/${encodeURIComponent(video.body.id)}/evidence/${encodeURIComponent(video.body.files[0].originalArtifact)}`);

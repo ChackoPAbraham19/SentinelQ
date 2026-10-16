@@ -1,0 +1,7 @@
+node_modules/
+.runtime/
+recordings/
+downloads/
+*.log
+application_demo.mp4
+application_demo.previous-*.mp4

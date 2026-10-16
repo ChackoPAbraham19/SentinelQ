@@ -75,7 +75,8 @@ export default function EvidenceCapture({ onAdd, onBusy, disabled, remainingByte
       setState('finishing');
       canvas.toBlob(blob => {
         if (generation !== photoGeneration.current) return;
-        if (!blob || blob.size > remainingBytes) { setState('idle'); setError('Photo could not fit within the evidence size limit. Remove another attachment and try again.'); return; }
+        if (!blob?.size) { setState('idle'); setError('The camera returned an empty photo. Try again or attach a photo instead.'); return; }
+        if (blob.size > Math.min(remainingBytes, MAX_EVIDENCE_BYTES)) { setState('idle'); setError('Photo could not fit within the evidence size limit. Remove another attachment and try again.'); return; }
         setFile(new File([blob], `capture-photo-${Date.now()}.jpg`, { type: 'image/jpeg' }));
         setState('review');
       }, 'image/jpeg', 0.9);
@@ -95,6 +96,7 @@ export default function EvidenceCapture({ onAdd, onBusy, disabled, remainingByte
     </div>
     {state === 'idle' && !file && <label className="capture-camera-choice">Camera preference<select value={facing} disabled={disabled} onChange={event => setFacing(event.target.value)}><option value="environment">Back camera</option><option value="user">Front camera</option></select></label>}
     <small>Video: up to 45 seconds · Audio: up to 2 minutes · Five files / 8 MiB combined</small>
+    {!disabled && remainingBytes <= 0 && <p role="status">The evidence size limit is reached. Remove an attachment to capture more.</p>}
     {error && <p className="inline-warning" role="alert">{error}</p>}
     {state === 'requesting' && <p role="status">Waiting for camera or microphone permission…</p>}
     {stream && kind !== 'audio' && <video className="capture-preview" ref={video} autoPlay muted playsInline onLoadedData={() => setCameraReady(true)} onClick={() => video.current?.play().catch(() => {})} aria-label="Live camera preview" />}

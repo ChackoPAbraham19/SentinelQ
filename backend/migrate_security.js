@@ -11,6 +11,21 @@ const AUDIT_KEY = requireSecret('SENTINELQ_AUDIT_KEY', 32);
 const processedArtifacts = new Map();
 const report = { migratedAt: new Date().toISOString(), cases: 0, artifacts: 0, messages: 0, failedArtifacts: [] };
 
+// This historical migration rebuilds v1 audit/ledger baselines. Refuse before
+// any write if the vault now contains authenticated v2 records or queue jobs.
+for (const name of fs.readdirSync(DATA_DIR).filter(name => /^CASE-[A-Z0-9-]+\.json$/i.test(name))) {
+  const record = JSON.parse(fs.readFileSync(path.join(DATA_DIR, name), 'utf8'));
+  if (record._integrity || /^CASE-V[23]-/.test(record.id || '')) throw new Error('Legacy migration cannot run on a v2/v3 vault. No migration or key rotation is needed.');
+}
+
+// Do not reinterpret a PQC artifact as plaintext in this historical utility.
+for (const name of fs.readdirSync(DATA_DIR).filter(name => /\.(original|sanitized)$/.test(name))) {
+  const handle = fs.openSync(path.join(DATA_DIR, name), 'r');
+  const magic = Buffer.alloc(4);
+  try { fs.readSync(handle, magic, 0, 4, 0); } finally { fs.closeSync(handle); }
+  if (magic.toString() === 'SQE3') throw new Error('Legacy migration cannot run on a post-quantum vault.');
+}
+
 for (const caseFile of fs.readdirSync(DATA_DIR).filter(name => /^CASE-[A-Z0-9-]+\.json$/i.test(name))) {
   const filePath = path.join(DATA_DIR, caseFile);
   const caseObj = JSON.parse(fs.readFileSync(filePath, 'utf8'));

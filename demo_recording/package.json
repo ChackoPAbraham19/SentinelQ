@@ -1,0 +1,8 @@
+{
+  "name": "sentinelq-demo-recording",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Isolated Chrome demonstration and recording; no application source changes",
+  "scripts": { "record": "node demo_script.cjs", "rehearse": "node demo_script.cjs --rehearsal" },
+  "dependencies": { "playwright": "1.64.0" }
+}

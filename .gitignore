@@ -1,13 +1,31 @@
+# Secrets: never commit real environment files
 .env
-backend/.env
-frontend/.env
+.env.*
+!.env.example
+**/.env
+**/.env.*
+!**/.env.example
+
+# Dependencies and build output
 node_modules/
-.venv/
-backend/data/
 frontend/dist/
-*.zip
+.venv/
+
+# Local evidence vaults and runtime data
+backend/data/
+backend/data-*/
+*.lock
+
+# Logs and archives
 *.log
+*.zip
+
+# Local tooling / operator state
 .render/
+supabase/.temp/
+
+# Court custodian key material
 court-private.pem
 court-release*.txt
 court-request*.json
+*.pem

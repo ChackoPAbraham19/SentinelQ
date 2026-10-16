@@ -79,7 +79,7 @@ test('comprehensive SentinelQ functionality audit', async (t) => {
     const res = await request('POST', '/report-base64', {
       title: 'Suspicious payment to Vendor XYZ',
       description: 'I work in Mangalore procurement. Vendor XYZ received payment before Tender T-102.',
-      files: []
+      files: [{ name: 'supporting-proof.txt', data: Buffer.from('Synthetic supporting evidence for this test.').toString('base64') }]
     });
     assert.equal(res.statusCode, 200);
     assert.ok(res.body.id);
@@ -91,7 +91,7 @@ test('comprehensive SentinelQ functionality audit', async (t) => {
     const submit = await request('POST', '/report-base64', {
       title: 'Recovery portal test',
       description: 'Testing recovery-based case access',
-      files: []
+      files: [{ name: 'supporting-proof.txt', data: Buffer.from('Synthetic supporting evidence for this test.').toString('base64') }]
     });
     assert.equal(submit.statusCode, 200);
     assert.ok(submit.body.recoverySecret);
@@ -198,7 +198,7 @@ test('comprehensive SentinelQ functionality audit', async (t) => {
     const submitRes = await request('POST', '/report-base64', {
       title: 'Status update test',
       description: 'Testing status',
-      files: []
+      files: [{ name: 'supporting-proof.txt', data: Buffer.from('Synthetic supporting evidence for this test.').toString('base64') }]
     });
     const caseId = submitRes.body.id;
     
@@ -218,7 +218,7 @@ test('comprehensive SentinelQ functionality audit', async (t) => {
     const submitRes = await request('POST', '/report-base64', {
       title: 'Chat test',
       description: 'Testing chat',
-      files: []
+      files: [{ name: 'supporting-proof.txt', data: Buffer.from('Synthetic supporting evidence for this test.').toString('base64') }]
     });
     const caseId = submitRes.body.id;
     
@@ -238,7 +238,7 @@ test('comprehensive SentinelQ functionality audit', async (t) => {
     const submitRes = await request('POST', '/report-base64', {
       title: 'Corruption allegation',
       description: 'Vendor XYZ received payment before tender',
-      files: []
+      files: [{ name: 'supporting-proof.txt', data: Buffer.from('Synthetic supporting evidence for this test.').toString('base64') }]
     });
     const caseId = submitRes.body.id;
     
@@ -300,7 +300,7 @@ test('comprehensive SentinelQ functionality audit', async (t) => {
 
   // ===== PHASE 9: METADATA SANITIZATION =====
 
-  await t.test('JPEG metadata is stripped', async () => {
+  await t.test('JPEG privacy work is queued without claiming metadata removal early', async () => {
     // Create a minimal JPEG with EXIF
     const jpegWithExif = Buffer.from([
       0xFF, 0xD8, // SOI
@@ -323,12 +323,14 @@ test('comprehensive SentinelQ functionality audit', async (t) => {
     });
     
     assert.equal(res.statusCode, 200);
-    assert.equal(res.body.files[0].metadataRemoved, true);
+    assert.equal(res.body.files[0].processingStatus, 'QUEUED');
+    assert.equal(res.body.files[0].metadataRemoved, false);
+    assert.equal(res.body.files[0].sanitizedHash, null);
   });
 
   // ===== PHASE 10: INVALID VIDEO FAILS CLOSED =====
 
-  await t.test('invalid video processing returns FAILED without a derivative', async () => {
+  await t.test('unprocessed video is queued without a derivative', async () => {
     // Create a minimal MP4-like file
     const videoFile = Buffer.concat([Buffer.alloc(4), Buffer.from('ftypisom'), Buffer.from('x'.repeat(100))]);
     const b64 = videoFile.toString('base64');
@@ -341,7 +343,7 @@ test('comprehensive SentinelQ functionality audit', async (t) => {
     
     assert.equal(res.statusCode, 200);
     assert.ok(res.body.files[0]);
-    assert.equal(res.body.files[0].processingStatus, 'FAILED');
+    assert.equal(res.body.files[0].processingStatus, 'QUEUED');
     // Sanitized hash should be null for failed video
     assert.equal(res.body.files[0].sanitizedHash, null);
   });
@@ -353,7 +355,7 @@ test('comprehensive SentinelQ functionality audit', async (t) => {
     const res = await request('POST', '/report-base64', {
       title: 'Oversized',
       description: hugeString,
-      files: []
+      files: [{ name: 'supporting-proof.txt', data: Buffer.from('Synthetic supporting evidence for this test.').toString('base64') }]
     });
     
     assert.equal(res.statusCode, 413);
@@ -398,13 +400,13 @@ test('comprehensive SentinelQ functionality audit', async (t) => {
     const case1 = await request('POST', '/report-base64', {
       title: 'Vendor XYZ Payment',
       description: 'Vendor XYZ received payment before Tender T-102',
-      files: []
+      files: [{ name: 'supporting-proof.txt', data: Buffer.from('Synthetic supporting evidence for this test.').toString('base64') }]
     });
     
     const case2 = await request('POST', '/report-base64', {
       title: 'Vendor XYZ Tender Issue',
       description: 'Payment to Vendor XYZ happened before Tender T-102 award',
-      files: []
+      files: [{ name: 'supporting-proof.txt', data: Buffer.from('Synthetic supporting evidence for this test.').toString('base64') }]
     });
     
     const verify = await request('GET', `/cases/${case1.body.id}/verification`, null, authToken);

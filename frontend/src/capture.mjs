@@ -37,6 +37,8 @@ export class CaptureSession {
   }
   releaseDevices() {
     clearTimeout(this.timer);
+    this.trackListeners?.forEach(([track, listener]) => track.removeEventListener?.('ended', listener));
+    this.trackListeners = [];
     this.stream?.getTracks().forEach(track => track.stop());
     this.stream = null;
     this.onStream(null);
@@ -45,7 +47,8 @@ export class CaptureSession {
     this.generation++;
     if (this.recorder) {
       this.recorder.ondataavailable = this.recorder.onstop = this.recorder.onerror = null;
-      if (this.recorder.state !== 'inactive') this.recorder.stop();
+      // A failing recorder must never prevent the camera/microphone from closing.
+      try { if (this.recorder.state !== 'inactive') this.recorder.stop(); } catch {}
       this.recorder = null;
     }
     this.releaseDevices();
@@ -71,7 +74,11 @@ export class CaptureSession {
       if (generation !== this.generation) { stream.getTracks().forEach(track => track.stop()); return; }
       this.stream = stream;
       this.onStream(stream);
-      for (const track of stream.getTracks()) track.addEventListener('ended', () => this.fail(new Error('Capture was interrupted. Please try again.'), generation), { once: true });
+      this.trackListeners = stream.getTracks().map(track => {
+        const listener = () => this.fail(new Error('Capture was interrupted. Please try again.'), generation);
+        track.addEventListener('ended', listener, { once: true });
+        return [track, listener];
+      });
       if (kind === 'photo') { this.onState('camera'); return; }
       const recorder = new this.Recorder(stream, { mimeType: format[0], audioBitsPerSecond: 64000, ...(kind === 'video' ? { videoBitsPerSecond: 900000 } : {}) });
       this.recorder = recorder;
@@ -102,8 +109,8 @@ export class CaptureSession {
   stop() {
     if (this.recorder?.state === 'recording') {
       this.onState('finishing');
-      this.recorder.stop();
-      this.releaseDevices();
+      try { this.recorder.stop(); this.releaseDevices(); }
+      catch (error) { this.fail(error, this.generation); }
     }
   }
 }

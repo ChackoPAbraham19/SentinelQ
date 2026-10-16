@@ -65,12 +65,12 @@ async function main() {
     assert.equal((await request('GET', route + '?original=1', null, token, { 'X-Original-Grant': grant.body.grant })).status, 403);
   }
   const stored = await cloud.getCase(caseId);
-  assert.match(stored.payload.title, /^SQF2:/);
+  assert.match(stored.payload.title, /^SQF3:/);
   assert.ok(!JSON.stringify(stored.payload).includes(title));
   const decrypted = decryptCaseFields(stored.payload);
   for (const file of decrypted.files) {
     const encrypted = await cloud.readArtifact(file.originalArtifact);
-    assert.equal(encrypted.subarray(0, 4).toString(), 'SQE2');
+    assert.equal(encrypted.subarray(0, 4).toString(), 'SQE3');
     const publicResponse = await fetch(`${cloud.url}/storage/v1/object/public/${cloud.bucket}/${encodeURIComponent(file.originalArtifact)}`);
     assert.ok(!publicResponse.ok, 'Evidence unexpectedly public');
   }

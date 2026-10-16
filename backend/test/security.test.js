@@ -88,7 +88,7 @@ test('SentinelQ security and IDOR tests', async (t) => {
     const caseRes = await request('POST', '/report-base64', {
       title: 'Restricted case',
       description: 'Only certain people can see this',
-      files: []
+      files: [{ name: 'supporting-proof.txt', data: Buffer.from('Synthetic supporting evidence for this test.').toString('base64') }]
     });
     const caseId = caseRes.body.id;
 
@@ -126,13 +126,13 @@ test('SentinelQ security and IDOR tests', async (t) => {
     assert.equal(badKey.statusCode, 403);
     const auditorLogin = await request('POST', '/auth/login', { username: 'auditor', password: 'test-auditor-password-2026' });
     const auditorAccess = await request('POST', `/cases/${caseId}/evidence/${evidenceId}/original-access`, { key: TEST_JUDICIAL_KEY, reason: 'Judicial review of this original evidence' }, auditorLogin.body.token);
-    assert.equal(auditorAccess.statusCode, 401);
+    assert.equal(auditorAccess.statusCode, 403);
     const auditorDetails = await request('POST', `/cases/${caseId}/judicial-details`, { key: TEST_JUDICIAL_KEY, reason: 'Judicial review of sensitive case information' }, auditorLogin.body.token);
-    assert.equal(auditorDetails.statusCode, 401);
+    assert.equal(auditorDetails.statusCode, 403);
     const release = await viewer.accessBody(request, `/cases/${caseId}/evidence/${evidenceId}`, adminToken, 'Judicial review of this original evidence');
     const secondLogin = await request('POST', '/auth/login', { username: 'admin', password: TEST_ADMIN_PASSWORD });
     assert.equal((await request('POST', `/cases/${caseId}/evidence/${evidenceId}/original-access`, release, secondLogin.body.token)).statusCode, 403);
-    assert.equal((await request('POST', `/cases/${caseId}/evidence/${evidenceId}/viewer-challenge`, {}, auditorLogin.body.token)).statusCode, 401);
+    assert.equal((await request('POST', `/cases/${caseId}/evidence/${evidenceId}/viewer-challenge`, {}, auditorLogin.body.token)).statusCode, 403);
     const attempts = await Promise.all([
       request('POST', `/cases/${caseId}/evidence/${evidenceId}/original-access`, release, adminToken),
       request('POST', `/cases/${caseId}/evidence/${evidenceId}/original-access`, release, adminToken)
@@ -145,7 +145,7 @@ test('SentinelQ security and IDOR tests', async (t) => {
     assert.equal(originalRes.statusCode, 200);
     assert.equal(originalRes.body, testFile.toString());
     const storedOriginal = fs.readFileSync(path.join(testDataDir, caseRes.body.files[0].originalArtifact));
-    assert.equal(storedOriginal.subarray(0, 4).toString(), 'SQE2');
+    assert.equal(storedOriginal.subarray(0, 4).toString(), 'SQE3');
     assert.ok(!storedOriginal.includes(testFile));
     const reused = await request('GET', originalPath, null, adminToken, { 'X-Original-Grant': access.body.grant });
     assert.equal(reused.statusCode, 403);
@@ -165,7 +165,7 @@ test('SentinelQ security and IDOR tests', async (t) => {
     const caseRes = await request('POST', '/report-base64', {
       title: 'Evidence test',
       description: 'Test',
-      files: []
+      files: [{ name: 'supporting-proof.txt', data: Buffer.from('Synthetic supporting evidence for this test.').toString('base64') }]
     });
     const caseId = caseRes.body.id;
     
@@ -179,7 +179,7 @@ test('SentinelQ security and IDOR tests', async (t) => {
     const caseRes = await request('POST', '/report-base64', {
       title: 'Encryption test',
       description: 'Testing message encryption',
-      files: []
+      files: [{ name: 'supporting-proof.txt', data: Buffer.from('Synthetic supporting evidence for this test.').toString('base64') }]
     });
     const caseId = caseRes.body.id;
     
@@ -216,8 +216,11 @@ test('SentinelQ security and IDOR tests', async (t) => {
       files: [{ name: 'dup.txt', data: b64 }]
     });
     
-    // Second case should show duplicateCaseCount
-    assert.ok(case2.body.files[0].duplicateCaseCount >= 1);
+    // Duplicate detection belongs to authorized review; submission must not
+    // disclose whether somebody else has already supplied these bytes.
+    assert.equal(case2.body.files[0].duplicateCaseCount, undefined);
+    const checked = await request('GET', `/cases/${case2.body.id}/verification`, null, adminToken);
+    assert.ok(checked.body.verification.warnings.some(value => value.includes('Duplicate evidence')));
   });
 
   await t.test('Verification shows correlation properly', async () => {
@@ -225,13 +228,13 @@ test('SentinelQ security and IDOR tests', async (t) => {
     const case1 = await request('POST', '/report-base64', {
       title: 'Corruption - Vendor A',
       description: 'Vendor A received improper payment for contract approval',
-      files: []
+      files: [{ name: 'supporting-proof.txt', data: Buffer.from('Synthetic supporting evidence for this test.').toString('base64') }]
     });
     
     const case2 = await request('POST', '/report-base64', {
       title: 'Corruption - Same Vendor',
       description: 'Vendor A payment linked to contract approval process',
-      files: []
+      files: [{ name: 'supporting-proof.txt', data: Buffer.from('Synthetic supporting evidence for this test.').toString('base64') }]
     });
     
     const verify = await request('GET', `/cases/${case1.body.id}/verification`, null, adminToken);
@@ -249,7 +252,7 @@ test('SentinelQ security and IDOR tests', async (t) => {
     const caseRes = await request('POST', '/report-base64', {
       title: 'Audit test',
       description: 'Testing audit',
-      files: []
+      files: [{ name: 'supporting-proof.txt', data: Buffer.from('Synthetic supporting evidence for this test.').toString('base64') }]
     });
     const caseId = caseRes.body.id;
     
@@ -285,13 +288,13 @@ test('SentinelQ security and IDOR tests', async (t) => {
     
     const case1 = await request('POST', '/report-base64', {
       title: 'Hash test 1',
-      description: 'Test',
+      description: 'Independent incident for Hash test 1',
       files: [{ name: 'a.txt', data: file1.toString('base64') }]
     });
     
     const case2 = await request('POST', '/report-base64', {
       title: 'Hash test 2',
-      description: 'Test',
+      description: 'Independent incident for Hash test 2',
       files: [{ name: 'b.txt', data: file2.toString('base64') }]
     });
     
@@ -307,13 +310,13 @@ test('SentinelQ security and IDOR tests', async (t) => {
     
     const case1 = await request('POST', '/report-base64', {
       title: 'Consistency test 1',
-      description: 'Test',
+      description: 'Independent incident for Consistency test 1',
       files: [{ name: 'test.txt', data: b64 }]
     });
     
     const case2 = await request('POST', '/report-base64', {
       title: 'Consistency test 2',
-      description: 'Test',
+      description: 'Independent incident for Consistency test 2',
       files: [{ name: 'test.txt', data: b64 }]
     });
     
@@ -329,7 +332,7 @@ test('SentinelQ security and IDOR tests', async (t) => {
     const caseRes = await request('POST', '/report-base64', {
       title: 'Summary test',
       description: 'This is the case description',
-      files: []
+      files: [{ name: 'supporting-proof.txt', data: Buffer.from('Synthetic supporting evidence for this test.').toString('base64') }]
     });
     const caseId = caseRes.body.id;
     
@@ -373,7 +376,7 @@ test('SentinelQ security and IDOR tests', async (t) => {
     const caseRes = await request('POST', '/report-base64', {
       title: 'Determinism test',
       description: 'A recurring pattern of suspicious activity',
-      files: []
+      files: [{ name: 'supporting-proof.txt', data: Buffer.from('Synthetic supporting evidence for this test.').toString('base64') }]
     });
     const caseId = caseRes.body.id;
     
@@ -436,7 +439,7 @@ test('SentinelQ security and IDOR tests', async (t) => {
     const caseRes = await request('POST', '/report-base64', {
       title: 'Status audit test',
       description: 'Testing status change auditing',
-      files: []
+      files: [{ name: 'supporting-proof.txt', data: Buffer.from('Synthetic supporting evidence for this test.').toString('base64') }]
     });
     const caseId = caseRes.body.id;
     
@@ -479,7 +482,7 @@ test('SentinelQ security and IDOR tests', async (t) => {
       title: 'Workplace report',
       description: 'My name is Taylor and I work at North Office.',
       anonymizedDescription: 'A person reported an event at a workplace.',
-      files: []
+      files: [{ name: 'supporting-proof.txt', data: Buffer.from('Synthetic supporting evidence for this test.').toString('base64') }]
     });
     assert.equal(report.statusCode, 200);
     const ordinary = await request('GET', `/cases/${report.body.id}`, null, adminToken);
@@ -491,10 +494,10 @@ test('SentinelQ security and IDOR tests', async (t) => {
   });
 
   await t.test('case narrative is encrypted at rest', async () => {
-    const created = await request('POST', '/report-base64', { title: 'At-rest test', description: 'Sensitive narrative marker', files: [] });
+    const created = await request('POST', '/report-base64', { title: 'At-rest test', description: 'Sensitive narrative marker', files: [{ name: 'supporting-proof.txt', data: Buffer.from('Synthetic supporting evidence for this test.').toString('base64') }] });
     const stored = JSON.parse(fs.readFileSync(path.join(testDataDir, `${created.body.id}.json`), 'utf8'));
-    assert.match(stored.title, /^SQF2:/);
-    assert.match(stored.description, /^SQF2:/);
+    assert.match(stored.title, /^SQF3:/);
+    assert.match(stored.description, /^SQF3:/);
     assert.ok(!JSON.stringify(stored).includes('Sensitive narrative marker'));
   });
 

@@ -37,7 +37,7 @@ for (const [label, publicKey] of [['missing', ''], ['invalid', 'invalid-public-k
     }
     assert.ok(started, output);
     const readiness = await fetch(base + '/evidence-intake');
-    assert.deepEqual(await readiness.json(), { ok: true, ready: true });
+    assert.deepEqual(await readiness.json(), { ok: true, ready: true, evidenceRequired: true });
     const report = { title: 'Intake regression test', description: 'Synthetic local test report', files: [{ name: 'note.txt', data: Buffer.from('Synthetic evidence').toString('base64') }] };
     for (const [file, code] of [
       [{ name: 'capture.webm', data: 'opus;base64' }, 'INVALID_EVIDENCE_ENCODING'],
@@ -57,7 +57,7 @@ for (const [label, publicKey] of [['missing', ''], ['invalid', 'invalid-public-k
     assert.equal(body.files[0].originalProtection, 'VIEWER_KEY_PHOTO');
     assert.equal(body.files[0].processingStatus, 'COMPLETE');
     const stored = fs.readFileSync(path.join(dataDir, body.files[0].originalArtifact));
-    assert.equal(stored.subarray(0,4).toString(), 'SQE2');
+    assert.equal(stored.subarray(0,4).toString(), 'SQE3');
     assert.ok(!stored.includes(Buffer.from('Synthetic evidence')));
     if (label === 'missing') {
       const call = async (route, payload, token) => {
@@ -69,7 +69,7 @@ for (const [label, publicKey] of [['missing', ''], ['invalid', 'invalid-public-k
       assert.equal((await call('/courts', { username: 'court-one', password: 'court-test-password-2026', role: 'ADMIN' }, admin)).body.role, 'COURT');
       const court = (await call('/auth/login', { username: 'court-one', password: 'court-test-password-2026' })).body.token;
       assert.ok(court);
-      assert.equal((await call('/courts', { username: 'court-two', password: 'court-test-password-2026' }, court)).status, 401);
+      assert.equal((await call('/courts', { username: 'court-two', password: 'court-test-password-2026' }, court)).status, 403);
       assert.equal((await call('/viewer-key', { password: 'incorrect' }, court)).status, 403);
       const courtKey = (await call('/viewer-key', { password: 'court-test-password-2026' }, court)).body.key;
       const adminKey = (await call('/viewer-key', { password: 'test-admin-password-2026' }, admin)).body.key;
@@ -98,10 +98,10 @@ for (const [label, publicKey] of [['missing', ''], ['invalid', 'invalid-public-k
       assert.equal(entry.role, 'COURT');
       assert.ok(entry.viewerPhotoHash);
       const encryptedPhoto = fs.readFileSync(path.join(dataDir, entry.viewerPhotoArtifact));
-      assert.equal(encryptedPhoto.subarray(0,4).toString(), 'SQE2');
+      assert.equal(encryptedPhoto.subarray(0,4).toString(), 'SQE3');
       const photoRoute = `/access-audits/${access.body.accessId}/photo`;
       assert.equal((await call(photoRoute)).status, 401);
-      assert.equal((await call(photoRoute, undefined, court)).status, 401);
+      assert.equal((await call(photoRoute, undefined, court)).status, 403);
       const photo = await fetch(base + photoRoute, { headers: { Authorization: `Bearer ${admin}` } });
       assert.equal(photo.status, 200);
       assert.equal(photo.headers.get('content-type'), 'image/png');

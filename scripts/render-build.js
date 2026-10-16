@@ -7,5 +7,6 @@ function run(command, args, cwd = root) {
   if (result.error || result.status !== 0) process.exit(result.status || 1);
 }
 run('ffmpeg', ['-version']);
+run(process.platform === 'win32' ? 'npm.cmd' : 'npm', ['ci', '--omit=dev', '--ignore-scripts', '--no-audit', '--no-fund'], path.join(root, 'backend'));
 run(process.platform === 'win32' ? 'npm.cmd' : 'npm', ['ci', '--include=dev', '--no-audit', '--no-fund'], path.join(root, 'frontend'));
 run(process.execPath, ['build.js'], path.join(root, 'frontend'));

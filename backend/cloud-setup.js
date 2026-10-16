@@ -5,6 +5,8 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const { isDeepStrictEqual } = require('node:util');
+const crypto = require('node:crypto');
+const { sealCase } = require('./case-integrity');
 const { SupabaseStorage, LocalStorage } = require('./storage');
 const courtVault = require('./court-vault');
 const { encryptBuffer, decryptBuffer, encryptCaseFields, decryptCaseFields, verifySignedLines, loadAuthorityUsers } = require('./index_no_deps');
@@ -74,7 +76,7 @@ async function main() {
     const existing = await cloud.getCase(item.id);
     if (existing) {
       if (!isDeepStrictEqual(decryptCaseFields(existing.payload), item)) throw Error('Cloud case differs; refusing to overwrite');
-    } else await cloud.saveCase(item.id, encryptCaseFields(item));
+    } else await cloud.saveCase(item.id, sealCase(encryptCaseFields(item), crypto.createHash('sha256').update(process.env.SENTINELQ_STORAGE_KEY).digest()));
   }
   if (!(await cloud.getAuthorities()).length) await cloud.bootstrapAuthorities(loadAuthorityUsers());
   console.log(`Migration verified: ${rows.length} cases, ${objects} encrypted evidence objects. Local files retained.`);

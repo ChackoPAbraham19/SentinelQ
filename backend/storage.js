@@ -32,40 +32,87 @@ function authorityName(name) {
 
 class LocalStorage {
   constructor(directory) { this.directory = directory; this.provider = 'local'; this.locks = new Map(); }
-  async init() { await fs.promises.mkdir(this.directory, { recursive: true }); }
+  async init() { await fs.promises.mkdir(this.directory, { recursive: true, mode: 0o700 }); }
   async getCase(id) {
-    try { return { payload: JSON.parse(await fs.promises.readFile(path.join(this.directory, `${caseId(id)}.json`), 'utf8')), revision: null }; }
+    try {
+      const payload = JSON.parse(await fs.promises.readFile(path.join(this.directory, `${caseId(id)}.json`), 'utf8'));
+      return { payload, revision: payload._localRevision || 0 };
+    }
     catch (error) { if (error.code === 'ENOENT') return null; throw error; }
   }
   async listCases() {
     const names = (await fs.promises.readdir(this.directory)).filter(name => /^CASE-.*\.json$/.test(name));
     return Promise.all(names.map(name => this.getCase(name.slice(0, -5))));
   }
-  async saveCase(id, payload) {
-    const target = path.join(this.directory, `${caseId(id)}.json`);
-    const temporary = `${target}.${crypto.randomUUID()}.tmp`;
-    await fs.promises.writeFile(temporary, JSON.stringify(payload, null, 2), { mode: 0o600 });
-    await fs.promises.rename(temporary, target);
-    return null;
+  async listProcessingCases() { return (await this.listCases()).filter(row => row.payload.processingPending); }
+  async saveCase(id, payload, revision = 0) {
+    const lock = `case:${caseId(id)}`;
+    const previous = this.locks.get(lock) || Promise.resolve();
+    const operation = previous.catch(() => {}).then(async () => {
+      const existing = await this.getCase(id);
+      if ((existing?.revision || 0) !== revision || (existing && revision === 0 && existing.payload._localRevision)) throw new StorageError('Case revision conflict', 409);
+      const nextRevision = revision + 1;
+      const target = path.join(this.directory, `${id}.json`);
+      const temporary = `${target}.${crypto.randomUUID()}.tmp`;
+      try {
+        const handle = await fs.promises.open(temporary, 'wx', 0o600);
+        try { await handle.writeFile(JSON.stringify({ ...payload, _localRevision: nextRevision }, null, 2)); await handle.sync(); }
+        finally { await handle.close(); }
+        await fs.promises.rename(temporary, target);
+      } finally { await fs.promises.unlink(temporary).catch(() => {}); }
+      return nextRevision;
+    });
+    this.locks.set(lock, operation);
+    try { return await operation; } finally { if (this.locks.get(lock) === operation) this.locks.delete(lock); }
   }
   async readArtifact(name) {
     try { return await fs.promises.readFile(path.join(this.directory, artifactName(name))); }
     catch (error) { if (error.code === 'ENOENT') return null; throw error; }
   }
-  async writeArtifact(name, bytes) { await fs.promises.writeFile(path.join(this.directory, artifactName(name)), bytes, { mode: 0o600 }); }
+  async writeArtifact(name, bytes) {
+    if (!Buffer.isBuffer(bytes) || !['SQE2', 'SQE3', 'SQC1'].includes(bytes.subarray(0, 4).toString())) throw new StorageError('Only encrypted evidence may be uploaded', 400);
+    const handle = await fs.promises.open(path.join(this.directory, artifactName(name)), 'wx', 0o600);
+    try { await handle.writeFile(bytes); await handle.sync(); } finally { await handle.close(); }
+  }
   async removeArtifact(name) { await fs.promises.unlink(path.join(this.directory, artifactName(name))).catch(error => { if (error.code !== 'ENOENT') throw error; }); }
+  async listCaseArtifacts(id) {
+    const prefix = `${caseId(id)}-`;
+    return (await fs.promises.readdir(this.directory)).filter(name => name.startsWith(prefix) && /\.(original|sanitized)$/.test(name)).map(artifactName);
+  }
   async readLog(stream) {
     const file = streamName(stream) === 'audit' ? 'audit.log' : 'ledger.txt';
     try { return (await fs.promises.readFile(path.join(this.directory, file), 'utf8')).split(/\r?\n/).filter(Boolean); }
     catch (error) { if (error.code === 'ENOENT') return []; throw error; }
   }
   async appendLog(stream, makeLine) {
+    return this.appendLogs(stream, lines => [makeLine(lines)]);
+  }
+  // Appends several chained lines under one lock and one read of the stream.
+  async appendLogs(stream, makeLines) {
     streamName(stream);
     const previous = this.locks.get(stream) || Promise.resolve();
     const operation = previous.catch(() => {}).then(async () => {
-      const lines = await this.readLog(stream);
-      const line = makeLine(lines);
-      await fs.promises.appendFile(path.join(this.directory, stream === 'audit' ? 'audit.log' : 'ledger.txt'), `${line}\n`, { mode: 0o600 });
+      const filename = path.join(this.directory, stream === 'audit' ? 'audit.log' : 'ledger.txt');
+      const lockFile = `${filename}.lock`;
+      let handle;
+      for (let attempt = 0; attempt < 100; attempt++) {
+        try {
+          handle = await fs.promises.open(lockFile, 'wx', 0o600);
+          break;
+        } catch (error) {
+          if (error.code !== 'EEXIST') throw error;
+          await new Promise(resolve => setTimeout(resolve, 25));
+        }
+      }
+      if (!handle) throw new StorageError('Local storage is busy; retry the request', 409);
+      try {
+        const lines = await this.readLog(stream);
+        const added = makeLines(lines);
+        if (added.length) await fs.promises.appendFile(filename, added.map(line => `${line}\n`).join(''), { mode: 0o600 });
+      } finally {
+        await handle.close();
+        await fs.promises.unlink(lockFile).catch(error => { if (error.code !== 'ENOENT') throw error; });
+      }
     });
     this.locks.set(stream, operation);
     try { await operation; } finally { if (this.locks.get(stream) === operation) this.locks.delete(stream); }
@@ -156,6 +203,7 @@ class SupabaseStorage {
     }
   }
   async listCases() { return this.pages('sentinelq_cases', 'select=payload,revision&order=id'); }
+  async listProcessingCases() { return this.pages('sentinelq_cases', 'select=payload,revision&payload->>processingPending=eq.true&order=created_at'); }
   async saveCase(id, payload, revision = 0) {
     return this.request('/rest/v1/rpc/sentinelq_save_case', { method: 'POST', body: { p_id: caseId(id), p_payload: payload, p_revision: revision || 0 } });
   }
@@ -166,13 +214,21 @@ class SupabaseStorage {
   }
   async writeArtifact(name, bytes) {
     artifactName(name);
-    if (!Buffer.isBuffer(bytes) || !['SQE2', 'SQC1'].includes(bytes.subarray(0, 4).toString())) throw new StorageError('Only encrypted evidence may be uploaded', 400);
+    if (!Buffer.isBuffer(bytes) || !['SQE2', 'SQE3', 'SQC1'].includes(bytes.subarray(0, 4).toString())) throw new StorageError('Only encrypted evidence may be uploaded', 400);
     await this.request(`/storage/v1/object/${this.bucket}/${encodeURIComponent(name)}`, {
       method: 'POST', body: bytes, binary: true,
       headers: { 'x-upsert': 'false', 'Cache-Control': 'no-store' },
     });
   }
   async removeArtifact(name) { await this.request(`/storage/v1/object/${this.bucket}`, { method: 'DELETE', body: { prefixes: [artifactName(name)] } }); }
+  async listCaseArtifacts(id) {
+    const prefix = `${caseId(id)}-`, names = [];
+    for (let offset = 0; ; offset += 100) {
+      const page = await this.request(`/storage/v1/object/list/${this.bucket}`, { method: 'POST', body: { prefix: '', search: prefix, limit: 100, offset, sortBy: { column: 'name', order: 'asc' } } });
+      for (const item of page) if (item.id && item.name.startsWith(prefix) && /\.(original|sanitized)$/.test(item.name)) names.push(artifactName(item.name));
+      if (page.length < 100) return names;
+    }
+  }
   async readLog(stream) {
     const rows = await this.pages('sentinelq_log_entries', `stream=eq.${streamName(stream)}&select=line&order=sequence`);
     return rows.map(row => row.line);
